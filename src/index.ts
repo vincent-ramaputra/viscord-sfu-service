@@ -25,17 +25,23 @@ const io = new Server(server, {
 });
 const rooms = new Map<string, Room>();
 const peers = new Map<string, PeerData>();
-let worker: Worker = await (async () => {
-    return await mediasoup.createWorker()
-})();
+let worker: Worker;
 
-const ticketKey: CryptoKey = await (async () => {
+let ticketKey: CryptoKey;
+
+async function main() {
+    worker = await mediasoup.createWorker();
+
     if (!process.env.TICKET_PUBLIC_KEY) {
         throw new Error('TICKET_PUBLIC_KEY env is required');
     }
     const pem = Buffer.from(process.env.TICKET_PUBLIC_KEY, 'base64').toString();
-    return await importSPKI(pem, 'ES256');
-})();
+    ticketKey = await importSPKI(pem, 'ES256');
+
+    server.listen(Number(process.env.PORT), () => {
+        console.log('Server listening on port', process.env.PORT);
+    });
+}
 
 io.use(async (socket, next) => {
     try {
@@ -323,9 +329,6 @@ function handleCloseConsumer(roomId: string, consumerId: string, socket: Socket)
     room.consumers.delete(consumerId);
 }
 
-server.listen(Number(process.env.PORT), () => {
-    console.log('Server listening on port', process.env.PORT);
-});
 
 process.on("SIGTERM", () => {
     console.log("Shutting down SFU service...");
@@ -340,4 +343,9 @@ process.on("SIGTERM", () => {
 
     worker.close();
     process.exit(0);
+});
+
+main().catch((err) => {
+    console.error("Failed starting SFU service", err);
+    process.exit(1);
 });
