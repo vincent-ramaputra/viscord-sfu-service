@@ -50,7 +50,7 @@ io.on('connection', (socket: Socket) => {
     socket.on(ACTIVE_SPEAKER_STATE, async (payload: ActiveSpeakerStateDTO) => await handleUpdateActiveSpeakerState(currentRoomId, socket, payload));
     socket.on(CLOSE_PRODUCER, async ({ producerId }: { producerId: string }) => await handleCloseProducer(currentRoomId, producerId, socket));
     socket.on(CLOSE_CONSUMER, async ({ consumerId }: { consumerId: string }) => handleCloseConsumer(currentRoomId, consumerId, socket));
-    socket.on('close', async () => await handleCloseClient(currentRoomId, socket));
+    socket.on('disconnect', async () => await handleCloseClient(currentRoomId, socket));
     socket.on('reconnect', async () => console.log('client reconnects'))
 });
 
