@@ -12,6 +12,8 @@ import { PeerData } from "./interface/peer-data";
 import { createServer } from "http";
 import { ProducerCreatedDTO } from "./dto/producer-created.dto";
 import { ActiveSpeakerState as ActiveSpeakerStateDTO } from "./dto/active-speaker-state.dto";
+import { errors, importSPKI, jwtVerify } from 'jose';
+import { TicketClaims } from './schemas/ticket-claims.schema';
 
 const server = createServer();
 
@@ -23,14 +25,57 @@ const io = new Server(server, {
 });
 const rooms = new Map<string, Room>();
 const peers = new Map<string, PeerData>();
-let worker: Worker;
-await (async () => {
-    worker = await mediasoup.createWorker()
+let worker: Worker = await (async () => {
+    return await mediasoup.createWorker()
 })();
+
+const ticketKey: CryptoKey = await (async () => {
+    if (!process.env.TICKET_PUBLIC_KEY) {
+        throw new Error('TICKET_PUBLIC_KEY env is required');
+    }
+    const pem = Buffer.from(process.env.TICKET_PUBLIC_KEY, 'base64').toString();
+    return await importSPKI(pem, 'ES256');
+})();
+
+io.use(async (socket, next) => {
+    try {
+        const ticket = socket.handshake.auth?.ticket;
+        if (typeof ticket !== 'string') {
+            return next(new Error('Unauthorized'));
+        }
+
+        const { payload } = await jwtVerify(ticket, ticketKey, {
+            algorithms: ['ES256'],
+            issuer: 'guild-service',
+            audience: 'sfu-service',
+            clockTolerance: 5,
+            maxTokenAge: '60s'
+        });
+        const ticketClaims = TicketClaims.safeParse(payload);
+        if (!ticketClaims.success) {
+            console.error('Failed parsing ticket claims', ticketClaims.error);
+            return next(new Error('Unauthorized'));
+        }
+        socket.data.userId = ticketClaims.data.sub;
+        socket.data.channelId = ticketClaims.data.channelId;
+        return next();
+    } catch (error) {
+        if (error instanceof errors.JOSEError) {
+            console.error("JWT Verification failed", error.code);
+        }
+        else {
+            console.warn("JWT Verification failed", error);
+        }
+        return next(new Error('Unauthorized'));
+    }
+
+})
 
 io.on('connection', (socket: Socket) => {
     let currentRoomId: string;
-    socket.on(JOIN_ROOM, async ({ channelId, userId }: { channelId: string, userId: string }, callback) => {
+    socket.on(JOIN_ROOM, async (callback) => {
+        const userId = socket.data.userId;
+        const channelId = socket.data.channelId;
         currentRoomId = channelId;
         const result = await handleJoinRoom(socket, userId, currentRoomId);
         if (result === null) socket.disconnect();
@@ -126,7 +171,7 @@ async function handleProduce(roomId: string, socket: Socket, payload: CreateProd
 
     if (!transport || !peer) return null;
 
-    const producer = await transport.produce({ kind: payload.kind, rtpParameters: payload.rtpParameters, paused: payload.paused,  appData: payload.appData});
+    const producer = await transport.produce({ kind: payload.kind, rtpParameters: payload.rtpParameters, paused: payload.paused, appData: payload.appData });
     console.log('producer appdata', producer.appData);
     room.producers.set(producer.id, { producer: producer, userId: peer.userId });
     peer.producers.set(producer.id, producer);
