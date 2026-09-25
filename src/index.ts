@@ -24,7 +24,7 @@ const io = new Server(server, {
 const rooms = new Map<string, Room>();
 const peers = new Map<string, PeerData>();
 let worker: Worker;
-(async () => {
+await (async () => {
     worker = await mediasoup.createWorker()
 })();
 
@@ -37,7 +37,7 @@ io.on('connection', (socket: Socket) => {
 
         callback(result);
     });
-    socket.on(CREATE_TRANSPORT, async (callback) => callback(await handleCreateTransport(currentRoomId)));
+    socket.on(CREATE_TRANSPORT, async (callback) => callback(await handleCreateTransport(currentRoomId, socket)));
     socket.on(CONNECT_TRANSPORT, async (payload: ConnectTransportDTO, callback) => callback(await handleConnectTranport(currentRoomId, payload)));
     socket.on(CREATE_PRODUCER, async (payload: CreateProducerDTO, callback) => callback(await handleProduce(currentRoomId, socket, payload)));
     socket.on(CREATE_CONSUMER, async (payload: CreateConsumerDTO, callback) => callback(await handleConsume(currentRoomId, payload, socket)));
@@ -81,8 +81,9 @@ async function handleUpdateActiveSpeakerState(roomId: string, socket: Socket, pa
     socket.broadcast.to(roomId).emit(ACTIVE_SPEAKER_STATE, { ...payload, userId: peer.userId });
 }
 
-async function handleCreateTransport(roomId: string) {
+async function handleCreateTransport(roomId: string, socket: Socket) {
     const room = rooms.get(roomId)!;
+    const peer = peers.get(socket.id)!;
     const transport = await room.router.createWebRtcTransport({
         enableUdp: true,
         enableTcp: true,
@@ -99,6 +100,7 @@ async function handleCreateTransport(roomId: string) {
 
 
     room.transports.set(transport.id, transport);
+    peer.transports.set(transport.id, transport);
     return ({
         id: transport.id,
         iceParameters: transport.iceParameters,
