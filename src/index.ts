@@ -64,6 +64,8 @@ io.use(async (socket, next) => {
         }
         socket.data.userId = ticketClaims.data.sub;
         socket.data.channelId = ticketClaims.data.channelId;
+        socket.data.sessionId = ticketClaims.data.jti;
+
         return next();
     } catch (error) {
         if (error instanceof errors.JOSEError) {
