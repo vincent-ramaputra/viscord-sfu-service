@@ -103,28 +103,75 @@ io.use(async (socket, next) => {
 
 io.on('connection', (socket: Socket) => {
     let currentRoomId: string;
+    let state: 'none' | 'joining' | 'joined' = 'none';
     socket.on(JOIN_ROOM, async (callback) => {
         const userId = socket.data.userId;
         const channelId = socket.data.channelId;
         currentRoomId = channelId;
+
+        if (state !== 'none') {
+            callback(null);
+            return;
+        }
+        state = 'joining';
         const result = await handleJoinRoom(socket, userId, currentRoomId);
         if (result === null) socket.disconnect();
+        state = 'joined';
 
         callback(result);
     });
-    socket.on(CREATE_TRANSPORT, async (callback) => callback(await handleCreateTransport(currentRoomId, socket)));
-    socket.on(CONNECT_TRANSPORT, async (payload: ConnectTransportDTO, callback) => callback(await handleConnectTranport(currentRoomId, payload)));
-    socket.on(CREATE_PRODUCER, async (payload: CreateProducerDTO, callback) => callback(await handleProduce(currentRoomId, socket, payload)));
-    socket.on(CREATE_CONSUMER, async (payload: CreateConsumerDTO, callback) => callback(await handleConsume(currentRoomId, payload, socket)));
-    socket.on(RESUME_CONSUMER, async () => await handleResumeConsumer(currentRoomId, socket));
-    socket.on(PAUSE_CONSUMER, async () => await handlePauseConsumer(currentRoomId, socket));
-    socket.on(PAUSE_PRODUCER, async ({ producerId }: { producerId: string }) => await handlePauseProducer(currentRoomId, producerId, socket));
-    socket.on(RESUME_PRODUCER, async ({ producerId }: { producerId: string }) => await handleResumeProducer(currentRoomId, producerId, socket));
+    // Every handler below needs the room and peer that JOIN_ROOM creates. Before that (or while it is
+    // still awaiting createRouter) rooms.get(currentRoomId) is undefined, so reject instead of crashing.
+    socket.on(CREATE_TRANSPORT, async (callback) => {
+        if (state !== 'joined') return callback(null);
+        callback(await handleCreateTransport(currentRoomId, socket));
+    });
+    socket.on(CONNECT_TRANSPORT, async (payload: ConnectTransportDTO, callback) => {
+        if (state !== 'joined') return callback(null);
+        callback(await handleConnectTranport(currentRoomId, payload));
+    });
+    socket.on(CREATE_PRODUCER, async (payload: CreateProducerDTO, callback) => {
+        if (state !== 'joined') return callback(null);
+        callback(await handleProduce(currentRoomId, socket, payload));
+    });
+    socket.on(CREATE_CONSUMER, async (payload: CreateConsumerDTO, callback) => {
+        if (state !== 'joined') return callback(null);
+        callback(await handleConsume(currentRoomId, payload, socket));
+    });
+    socket.on(GET_PRODUCERS, async (callback) => {
+        if (state !== 'joined') return callback(null);
+        callback(await getProducers(currentRoomId));
+    });
+    socket.on(RESUME_CONSUMER, async () => {
+        if (state !== 'joined') return;
+        await handleResumeConsumer(currentRoomId, socket);
+    });
+    socket.on(PAUSE_CONSUMER, async () => {
+        if (state !== 'joined') return;
+        await handlePauseConsumer(currentRoomId, socket);
+    });
+    socket.on(PAUSE_PRODUCER, async ({ producerId }: { producerId: string }) => {
+        if (state !== 'joined') return;
+        await handlePauseProducer(currentRoomId, producerId, socket);
+    });
+    socket.on(RESUME_PRODUCER, async ({ producerId }: { producerId: string }) => {
+        if (state !== 'joined') return;
+        await handleResumeProducer(currentRoomId, producerId, socket);
+    });
+    socket.on(ACTIVE_SPEAKER_STATE, async (payload: ActiveSpeakerStateDTO) => {
+        if (state !== 'joined') return;
+        await handleUpdateActiveSpeakerState(currentRoomId, socket, payload);
+    });
+    socket.on(CLOSE_PRODUCER, async ({ producerId }: { producerId: string }) => {
+        if (state !== 'joined') return;
+        await handleCloseProducer(currentRoomId, producerId, socket);
+    });
+    socket.on(CLOSE_CONSUMER, async ({ consumerId }: { consumerId: string }) => {
+        if (state !== 'joined') return;
+        handleCloseConsumer(currentRoomId, consumerId, socket);
+    });
+    // Cleanup is deliberately unguarded: it must run in any state, and handleCloseClient returns early when there is no peer.
     socket.on(CLOSE_SFU_CLIENT, async () => await handleCloseClient(currentRoomId, socket));
-    socket.on(GET_PRODUCERS, async (callback) => callback(await getProducers(currentRoomId)));
-    socket.on(ACTIVE_SPEAKER_STATE, async (payload: ActiveSpeakerStateDTO) => await handleUpdateActiveSpeakerState(currentRoomId, socket, payload));
-    socket.on(CLOSE_PRODUCER, async ({ producerId }: { producerId: string }) => await handleCloseProducer(currentRoomId, producerId, socket));
-    socket.on(CLOSE_CONSUMER, async ({ consumerId }: { consumerId: string }) => handleCloseConsumer(currentRoomId, consumerId, socket));
     socket.on('disconnect', async () => await handleCloseClient(currentRoomId, socket));
     socket.on('reconnect', async () => console.log('client reconnects'))
 });
@@ -133,14 +180,18 @@ async function handleJoinRoom(socket: Socket, userId: string, roomId: string) {
     socket.join(roomId);
 
     if (!rooms.has(roomId)) {
-        const router = await worker.createRouter(ROUTER_CONFIG);
-
-        rooms.set(roomId, {
-            router,
-            transports: new Map(),
-            consumers: new Map(),
-            producers: new Map(),
-        });
+        try {
+            const router = await worker.createRouter(ROUTER_CONFIG);
+            rooms.set(roomId, {
+                router,
+                transports: new Map(),
+                consumers: new Map(),
+                producers: new Map(),
+            });
+        } catch (error) {
+            console.error(error)
+            return null;
+        }
     }
 
     peers.set(socket.id, { userId: userId, consumers: new Map(), producers: new Map(), transports: new Map() });
@@ -368,6 +419,7 @@ process.on("SIGTERM", () => {
     worker.close();
     process.exit(0);
 });
+
 
 main().catch((err) => {
     console.error("Failed starting SFU service", err);
