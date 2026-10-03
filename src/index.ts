@@ -7,7 +7,7 @@ import { CONNECT_TRANSPORT, CREATE_CONSUMER, CREATE_TRANSPORT, CLOSE_SFU_CLIENT,
 import { ConnectTransportDTO } from "./dto/connect-transport.dto";
 import { CreateProducerDTO } from "./dto/create-producer.dto";
 import { CreateConsumerDTO } from "./dto/create-consumer.dto";
-import { ROUTER_CONFIG } from "./const/configs";
+import { CLOCK_TOLERANCE_S, ROUTER_CONFIG } from "./const/configs";
 import { PeerData } from "./interface/peer-data";
 import { createServer } from "http";
 import { ProducerCreatedDTO } from "./dto/producer-created.dto";
@@ -28,6 +28,15 @@ const peers = new Map<string, PeerData>();
 let worker: Worker;
 
 let ticketKey: CryptoKey;
+const jtiMap: Map<string, number> = new Map();
+
+function clearExpiredJti() {
+    for (const [jti, exp] of jtiMap.entries()) {
+        if (exp < Date.now() / 1000) {
+            jtiMap.delete(jti);
+        }
+    }
+}
 
 async function main() {
     worker = await mediasoup.createWorker();
@@ -37,6 +46,8 @@ async function main() {
     }
     const pem = Buffer.from(process.env.TICKET_PUBLIC_KEY, 'base64').toString();
     ticketKey = await importSPKI(pem, 'ES256');
+
+    setInterval(clearExpiredJti, 30000).unref();
 
     server.listen(Number(process.env.PORT), () => {
         console.log('Server listening on port', process.env.PORT);
@@ -54,17 +65,28 @@ io.use(async (socket, next) => {
             algorithms: ['ES256'],
             issuer: 'guild-service',
             audience: 'sfu-service',
-            clockTolerance: 5,
-            maxTokenAge: '60s'
+            maxTokenAge: '60s',
+            clockTolerance: CLOCK_TOLERANCE_S
         });
+
         const ticketClaims = TicketClaims.safeParse(payload);
         if (!ticketClaims.success) {
             console.error('Failed parsing ticket claims', ticketClaims.error);
             return next(new Error('Unauthorized'));
         }
-        socket.data.userId = ticketClaims.data.sub;
-        socket.data.channelId = ticketClaims.data.channelId;
-        socket.data.sessionId = ticketClaims.data.jti;
+
+        const { sub, jti, channelId, exp } = ticketClaims.data;
+
+        if (jtiMap.has(jti)) {
+            console.warn('Replayed voice ticket', { jti, sub });
+            return next(new Error('Unauthorized'));
+        }
+
+        socket.data.userId = sub;
+        socket.data.channelId = channelId;
+        socket.data.sessionId = jti;
+
+        jtiMap.set(jti, exp + CLOCK_TOLERANCE_S);
 
         return next();
     } catch (error) {

@@ -1,7 +1,8 @@
-import { object, uuid } from "zod";
+import { number, object, uuid } from "zod";
 
 export const TicketClaims = object({
     sub: uuid(),
     channelId: uuid(),
-    jti: uuid()
+    jti: uuid(),
+    exp: number(),
 })
