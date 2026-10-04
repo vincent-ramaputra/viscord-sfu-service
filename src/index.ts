@@ -14,15 +14,24 @@ import { ProducerCreatedDTO } from "./dto/producer-created.dto";
 import { ActiveSpeakerState as ActiveSpeakerStateDTO } from "./dto/active-speaker-state.dto";
 import { errors, importSPKI, jwtVerify } from 'jose';
 import { TicketClaims } from './schemas/ticket-claims.schema';
+import { JoinRoom, JoinRoomSchema } from './schemas/join-room.schema';
+import { connect, publish } from './events/publisher';
+import { randomUUID } from 'crypto';
+
+if (!process.env.SFU_INSTANCE) {
+    throw new Error("SFU_INSTANCE env is required");
+}
 
 const server = createServer();
-
 const io = new Server(server, {
     cors: {
         origin: 'https://localhost:3002',
         methods: ["GET", "POST"],
     }
 });
+const bootId = randomUUID();
+const sfuInstance: string = process.env.SFU_INSTANCE;
+
 const rooms = new Map<string, Room>();
 const peers = new Map<string, PeerData>();
 let worker: Worker;
@@ -46,8 +55,12 @@ async function main() {
     }
     const pem = Buffer.from(process.env.TICKET_PUBLIC_KEY, 'base64').toString();
     ticketKey = await importSPKI(pem, 'ES256');
-
     setInterval(clearExpiredJti, 30000).unref();
+
+    if (!process.env.AMQP_URL) {
+        throw new Error('AMQP_URL env is required');
+    }
+    await connect(process.env.AMQP_URL, { heartbeat: 30 });
 
     server.listen(Number(process.env.PORT), () => {
         console.log('Server listening on port', process.env.PORT);
@@ -104,7 +117,9 @@ io.use(async (socket, next) => {
 io.on('connection', (socket: Socket) => {
     let currentRoomId: string;
     let state: 'none' | 'joining' | 'joined' = 'none';
-    socket.on(JOIN_ROOM, async (callback) => {
+    socket.on(JOIN_ROOM, async (payload: unknown, callback) => {
+        if (typeof callback !== 'function') return;
+
         const userId = socket.data.userId;
         const channelId = socket.data.channelId;
         currentRoomId = channelId;
@@ -113,10 +128,36 @@ io.on('connection', (socket: Socket) => {
             callback(null);
             return;
         }
+
+        const joinRoomSchema = JoinRoomSchema.safeParse(payload);
+        if (!joinRoomSchema.success) {
+            callback(null);
+            return;
+        }
+
         state = 'joining';
-        const result = await handleJoinRoom(socket, userId, currentRoomId);
-        if (result === null) socket.disconnect();
+        const result = await handleJoinRoom(socket, userId, currentRoomId, joinRoomSchema.data);
+        if (result === null) {
+            socket.disconnect();
+            callback(null);
+            return;
+        }
+        if (socket.disconnected) {
+            peers.delete(socket.id);
+            return;
+        }
         state = 'joined';
+
+        publish('peer_joined', {
+            userId,
+            channelId,
+            sessionId: socket.data.sessionId,
+            bootId,
+            sfuInstance,
+            at: Date.now(),
+            isDeafened: joinRoomSchema.data.isDeafened,
+            isMuted: joinRoomSchema.data.isMuted
+        });
 
         callback(result);
     });
@@ -171,12 +212,12 @@ io.on('connection', (socket: Socket) => {
         handleCloseConsumer(currentRoomId, consumerId, socket);
     });
     // Cleanup is deliberately unguarded: it must run in any state, and handleCloseClient returns early when there is no peer.
-    socket.on(CLOSE_SFU_CLIENT, async () => await handleCloseClient(currentRoomId, socket));
-    socket.on('disconnect', async () => await handleCloseClient(currentRoomId, socket));
+    socket.on(CLOSE_SFU_CLIENT, async () => await handleCloseClient(currentRoomId, socket, 'left'));
+    socket.on('disconnect', async (reason) => await handleCloseClient(currentRoomId, socket, reason === 'client namespace disconnect' ? 'left' : 'dropped'));
     socket.on('reconnect', async () => console.log('client reconnects'))
 });
 
-async function handleJoinRoom(socket: Socket, userId: string, roomId: string) {
+async function handleJoinRoom(socket: Socket, userId: string, roomId: string, payload: JoinRoom) {
     socket.join(roomId);
 
     if (!rooms.has(roomId)) {
@@ -194,7 +235,14 @@ async function handleJoinRoom(socket: Socket, userId: string, roomId: string) {
         }
     }
 
-    peers.set(socket.id, { userId: userId, consumers: new Map(), producers: new Map(), transports: new Map() });
+    peers.set(socket.id, {
+        userId: userId,
+        consumers: new Map(),
+        producers: new Map(),
+        transports: new Map(),
+        isMuted: payload.isMuted,
+        isDeafened: payload.isDeafened
+    });
 
     const room = rooms.get(roomId)!;
     return { rtpCapabilities: room.router.rtpCapabilities };
@@ -340,7 +388,7 @@ async function handleResumeProducer(roomId: string, producerId: string, socket: 
 }
 
 
-async function handleCloseClient(roomId: string, socket: Socket) {
+async function handleCloseClient(roomId: string, socket: Socket, reason: 'left' | 'dropped') {
     const room = rooms.get(roomId)!;
     const socketId = socket.id;
 
@@ -365,6 +413,14 @@ async function handleCloseClient(roomId: string, socket: Socket) {
 
     peers.delete(socketId);
     socket.disconnect();
+
+    publish('peer_left', {
+        userId: socket.data.userId,
+        channelId: socket.data.channelId,
+        sessionId: socket.data.sessionId,
+        at: Date.now(),
+        reason
+    });
 
     return true;
 }

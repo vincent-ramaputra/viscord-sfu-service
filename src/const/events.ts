@@ -2,6 +2,7 @@
 export const USER_QUEUE = 'user_queue';
 export const GATEWAY_QUEUE = 'gateway_queue';
 export const CHANNEL_QUEUE = 'channel_queue';
+export const SFU_QUEUE = 'sfu_events';
 
 export const FRIEND_REQUEST_RECEIVED_EVENT = 'friend_request_received';
 export const FRIEND_REMOVED_EVENT = 'friend_removed';
@@ -53,3 +54,6 @@ export const VOICE_MUTE = 'voice_mute';
 export const VOICE_DEAFEN = 'voice_deafened';
 export const CLOSE_PRODUCER = 'close_producer';
 export const CLOSE_CONSUMER = 'close_consumer';
+
+export const PEER_JOINED = 'peer_joined';
+export const PEER_LEFT = 'peer_left';
