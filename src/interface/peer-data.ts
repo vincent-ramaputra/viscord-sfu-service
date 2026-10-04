@@ -5,4 +5,6 @@ export interface PeerData {
     transports: Map<string, Transport>;
     consumers: Map<string, Consumer>;
     producers: Map<string, Producer>;
+    isMuted: boolean;
+    isDeafened: boolean;
 }

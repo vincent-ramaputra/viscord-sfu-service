@@ -14,6 +14,7 @@ import { ProducerCreatedDTO } from "./dto/producer-created.dto";
 import { ActiveSpeakerState as ActiveSpeakerStateDTO } from "./dto/active-speaker-state.dto";
 import { errors, importSPKI, jwtVerify } from 'jose';
 import { TicketClaims } from './schemas/ticket-claims.schema';
+import { JoinRoom, JoinRoomSchema } from './schemas/join-room.schema';
 
 const server = createServer();
 
@@ -104,7 +105,9 @@ io.use(async (socket, next) => {
 io.on('connection', (socket: Socket) => {
     let currentRoomId: string;
     let state: 'none' | 'joining' | 'joined' = 'none';
-    socket.on(JOIN_ROOM, async (callback) => {
+    socket.on(JOIN_ROOM, async (payload: unknown, callback) => {
+        if (typeof callback !== 'function') return;
+
         const userId = socket.data.userId;
         const channelId = socket.data.channelId;
         currentRoomId = channelId;
@@ -113,8 +116,15 @@ io.on('connection', (socket: Socket) => {
             callback(null);
             return;
         }
+
+        const joinRoomSchema = JoinRoomSchema.safeParse(payload);
+        if (!joinRoomSchema.success) {
+            callback(null);
+            return;
+        }
+
         state = 'joining';
-        const result = await handleJoinRoom(socket, userId, currentRoomId);
+        const result = await handleJoinRoom(socket, userId, currentRoomId, joinRoomSchema.data);
         if (result === null) socket.disconnect();
         state = 'joined';
 
@@ -176,7 +186,7 @@ io.on('connection', (socket: Socket) => {
     socket.on('reconnect', async () => console.log('client reconnects'))
 });
 
-async function handleJoinRoom(socket: Socket, userId: string, roomId: string) {
+async function handleJoinRoom(socket: Socket, userId: string, roomId: string, payload: JoinRoom) {
     socket.join(roomId);
 
     if (!rooms.has(roomId)) {
@@ -194,7 +204,14 @@ async function handleJoinRoom(socket: Socket, userId: string, roomId: string) {
         }
     }
 
-    peers.set(socket.id, { userId: userId, consumers: new Map(), producers: new Map(), transports: new Map() });
+    peers.set(socket.id, {
+        userId: userId,
+        consumers: new Map(),
+        producers: new Map(),
+        transports: new Map(),
+        isMuted: payload.isMuted,
+        isDeafened: payload.isDeafened
+    });
 
     const room = rooms.get(roomId)!;
     return { rtpCapabilities: room.router.rtpCapabilities };
