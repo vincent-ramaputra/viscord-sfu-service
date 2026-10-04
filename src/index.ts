@@ -17,6 +17,7 @@ import { TicketClaims } from './schemas/ticket-claims.schema';
 import { JoinRoom, JoinRoomSchema } from './schemas/join-room.schema';
 import { connect, publish } from './events/publisher';
 import { randomUUID } from 'crypto';
+import { CLEAR_JTI_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, SNAPSHOT_INTERVAL_MS } from './const/time';
 
 if (!process.env.SFU_INSTANCE) {
     throw new Error("SFU_INSTANCE env is required");
@@ -47,6 +48,30 @@ function clearExpiredJti() {
     }
 }
 
+function sendHeartbeat() {
+    publish('sfu_heartbeat', {
+        sfuInstance,
+        bootId
+    });
+}
+
+// Built and published in one synchronous step, so no peer event can be published between reading `peers` and
+// sending the snapshot. On the same channel, every event queued after it describes a later change.
+function sendSnapshot() {
+    publish('sfu_snapshot', {
+        sfuInstance,
+        bootId,
+        at: Date.now(),
+        peers: Array.from(peers.values()).map(peer => ({
+            userId: peer.userId,
+            channelId: peer.channelId,
+            sessionId: peer.sessionId,
+            isMuted: peer.isMuted,
+            isDeafened: peer.isDeafened,
+        })),
+    });
+}
+
 async function main() {
     worker = await mediasoup.createWorker();
 
@@ -55,15 +80,24 @@ async function main() {
     }
     const pem = Buffer.from(process.env.TICKET_PUBLIC_KEY, 'base64').toString();
     ticketKey = await importSPKI(pem, 'ES256');
-    setInterval(clearExpiredJti, 30000).unref();
+    setInterval(clearExpiredJti, CLEAR_JTI_INTERVAL_MS).unref();
 
     if (!process.env.AMQP_URL) {
         throw new Error('AMQP_URL env is required');
     }
     await connect(process.env.AMQP_URL, {
         heartbeat: 30,
-        onConnected: () => publish('sfu_started', { sfuInstance, bootId, at: Date.now() })
+        onConnected: () => {
+            sendHeartbeat();
+            publish('sfu_started', { sfuInstance, bootId, at: Date.now() });
+            // Repairs joins and leaves that were dropped while the broker link was down.
+            sendSnapshot();
+        }
     });
+
+    setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS).unref();
+    // Periodic too, so any drift (e.g. a peer event lost without publisher confirms) is corrected within a minute.
+    setInterval(sendSnapshot, SNAPSHOT_INTERVAL_MS).unref();
 
     server.listen(Number(process.env.PORT), () => {
         console.log('Server listening on port', process.env.PORT);
@@ -240,6 +274,8 @@ async function handleJoinRoom(socket: Socket, userId: string, roomId: string, pa
 
     peers.set(socket.id, {
         userId: userId,
+        channelId: roomId,
+        sessionId: socket.data.sessionId,
         consumers: new Map(),
         producers: new Map(),
         transports: new Map(),
