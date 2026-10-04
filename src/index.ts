@@ -142,6 +142,10 @@ io.on('connection', (socket: Socket) => {
             callback(null);
             return;
         }
+        if (socket.disconnected) {
+            peers.delete(socket.id);
+            return;
+        }
         state = 'joined';
 
         publish('peer_joined', {
