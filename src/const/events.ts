@@ -59,3 +59,4 @@ export const PEER_JOINED = 'peer_joined';
 export const PEER_LEFT = 'peer_left';
 
 export const SFU_STARTED = 'sfu_started';
+export const SFU_HEARTBEAT = 'sfu_heartbeat';

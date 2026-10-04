@@ -1,0 +1,3 @@
+
+export const HEARTBEAT_INTERVAL_MS = 10000;
+export const CLEAR_JTI_INTERVAL_MS = 30000;

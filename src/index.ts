@@ -17,6 +17,7 @@ import { TicketClaims } from './schemas/ticket-claims.schema';
 import { JoinRoom, JoinRoomSchema } from './schemas/join-room.schema';
 import { connect, publish } from './events/publisher';
 import { randomUUID } from 'crypto';
+import { CLEAR_JTI_INTERVAL_MS, HEARTBEAT_INTERVAL_MS } from './const/time';
 
 if (!process.env.SFU_INSTANCE) {
     throw new Error("SFU_INSTANCE env is required");
@@ -47,6 +48,13 @@ function clearExpiredJti() {
     }
 }
 
+function sendHeartbeat() {
+    publish('sfu_heartbeat', {
+        sfuInstance,
+        bootId
+    });
+}
+
 async function main() {
     worker = await mediasoup.createWorker();
 
@@ -55,15 +63,20 @@ async function main() {
     }
     const pem = Buffer.from(process.env.TICKET_PUBLIC_KEY, 'base64').toString();
     ticketKey = await importSPKI(pem, 'ES256');
-    setInterval(clearExpiredJti, 30000).unref();
+    setInterval(clearExpiredJti, CLEAR_JTI_INTERVAL_MS).unref();
 
     if (!process.env.AMQP_URL) {
         throw new Error('AMQP_URL env is required');
     }
     await connect(process.env.AMQP_URL, {
         heartbeat: 30,
-        onConnected: () => publish('sfu_started', { sfuInstance, bootId, at: Date.now() })
+        onConnected: () => {
+            sendHeartbeat();
+            publish('sfu_started', { sfuInstance, bootId, at: Date.now() });
+        }
     });
+
+    setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS).unref();
 
     server.listen(Number(process.env.PORT), () => {
         console.log('Server listening on port', process.env.PORT);
