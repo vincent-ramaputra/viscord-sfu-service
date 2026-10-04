@@ -5,7 +5,7 @@ import { SFU_QUEUE } from "../const/events";
 let connection: amqp.RecoveringChannelModel | undefined;
 let channel: amqp.Channel | undefined;
 
-export async function connect(url: string, { heartbeat }: { heartbeat: number }) {
+export async function connect(url: string, { heartbeat, onConnected}: { heartbeat: number, onConnected: () => void}) {
     const connectionString = new URL(url);
     connectionString.searchParams.set("heartbeat", String(heartbeat))
 
@@ -23,6 +23,7 @@ export async function connect(url: string, { heartbeat }: { heartbeat: number })
                 });
 
                 channel = ch;
+                onConnected();
             }
         }
     });

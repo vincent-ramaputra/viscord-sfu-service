@@ -60,7 +60,10 @@ async function main() {
     if (!process.env.AMQP_URL) {
         throw new Error('AMQP_URL env is required');
     }
-    await connect(process.env.AMQP_URL, { heartbeat: 30 });
+    await connect(process.env.AMQP_URL, {
+        heartbeat: 30,
+        onConnected: () => publish('sfu_started', { sfuInstance, bootId, at: Date.now() })
+    });
 
     server.listen(Number(process.env.PORT), () => {
         console.log('Server listening on port', process.env.PORT);
