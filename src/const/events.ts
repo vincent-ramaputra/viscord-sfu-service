@@ -57,3 +57,5 @@ export const CLOSE_CONSUMER = 'close_consumer';
 
 export const PEER_JOINED = 'peer_joined';
 export const PEER_LEFT = 'peer_left';
+
+export const SFU_STARTED = 'sfu_started';
