@@ -3,7 +3,7 @@ import { Server, Socket } from "socket.io";
 import * as mediasoup from "mediasoup";
 import { Room } from "./interface/room";
 import { Worker } from "mediasoup/types";
-import { CONNECT_TRANSPORT, CREATE_CONSUMER, CREATE_TRANSPORT, CLOSE_SFU_CLIENT, JOIN_ROOM, CREATE_PRODUCER, RESUME_CONSUMER, PAUSE_CONSUMER, GET_PRODUCERS, PRODUCER_JOINED, ACTIVE_SPEAKER_STATE, VOICE_MUTE, RESUME_PRODUCER, PAUSE_PRODUCER, CLOSE_PRODUCER, CLOSE_CONSUMER } from "./const/events";
+import { CONNECT_TRANSPORT, CREATE_CONSUMER, CREATE_TRANSPORT, CLOSE_SFU_CLIENT, JOIN_ROOM, CREATE_PRODUCER, RESUME_CONSUMER, PAUSE_CONSUMER, GET_PRODUCERS, PRODUCER_JOINED, ACTIVE_SPEAKER_STATE, VOICE_MUTE, RESUME_PRODUCER, PAUSE_PRODUCER, CLOSE_PRODUCER, CLOSE_CONSUMER, SESSION_REPLACED } from "./const/events";
 import { ConnectTransportDTO } from "./dto/connect-transport.dto";
 import { CreateProducerDTO } from "./dto/create-producer.dto";
 import { CreateConsumerDTO } from "./dto/create-consumer.dto";
@@ -35,6 +35,8 @@ const sfuInstance: string = process.env.SFU_INSTANCE;
 
 const rooms = new Map<string, Room>();
 const peers = new Map<string, PeerData>();
+// userId → socket.id of that user's current peer on this SFU. One voice session per user: a new join replaces the old one.
+const socketByUser = new Map<string, string>();
 let worker: Worker;
 
 let ticketKey: CryptoKey;
@@ -195,6 +197,10 @@ io.on('connection', (socket: Socket) => {
             isDeafened: joinRoomSchema.data.isDeafened,
             isMuted: joinRoomSchema.data.isMuted
         });
+
+        // After peer_joined on purpose: guild-service stores the new session first, so the old one's peer_left is
+        // stale and nobody sees a leave and rejoin.
+        await replacePreviousSession(userId, socket);
 
         callback(result);
     });
@@ -427,6 +433,26 @@ async function handleResumeProducer(roomId: string, producerId: string, socket: 
 }
 
 
+/**
+ * Makes `socket` the user's only session on this SFU. A previous peer of the same user, in any room, is told
+ * `session_replaced` (so its client stops instead of reconnecting) and then closed. Without this, a second tab
+ * would leave the first one in the call, unlisted but still sending and receiving audio.
+ */
+async function replacePreviousSession(userId: string, socket: Socket) {
+    const previousSocketId = socketByUser.get(userId);
+    socketByUser.set(userId, socket.id);
+
+    if (!previousSocketId || previousSocketId === socket.id) return;
+
+    const previousSocket = io.sockets.sockets.get(previousSocketId);
+    const previousPeer = peers.get(previousSocketId);
+    if (!previousSocket || !previousPeer) return;
+
+    // Delivered before the disconnect that handleCloseClient sends: a socket's packets arrive in order.
+    previousSocket.emit(SESSION_REPLACED);
+    await handleCloseClient(previousPeer.channelId, previousSocket, 'left');
+}
+
 async function handleCloseClient(roomId: string, socket: Socket, reason: 'left' | 'dropped') {
     const room = rooms.get(roomId)!;
     const socketId = socket.id;
@@ -451,6 +477,8 @@ async function handleCloseClient(roomId: string, socket: Socket, reason: 'left' 
     }
 
     peers.delete(socketId);
+    // Only if it still points here: when a replaced session is closed, the index already points to the new one.
+    if (socketByUser.get(peer.userId) === socketId) socketByUser.delete(peer.userId);
     socket.disconnect();
 
     publish('peer_left', {
