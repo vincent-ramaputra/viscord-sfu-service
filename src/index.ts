@@ -244,6 +244,8 @@ io.on('connection', (socket: Socket) => {
         // After peer_joined on purpose: guild-service stores the new session first, so the old one's peer_left is
         // stale and nobody sees a leave and rejoin
         await replacePreviousSession(socket.data.userId, socket);
+
+        return result;
     }, { requireJoin: false });
 
     onRequest(CREATE_TRANSPORT, z.undefined(), async () => await handleCreateTransport(socket.data.channelId, socket));
