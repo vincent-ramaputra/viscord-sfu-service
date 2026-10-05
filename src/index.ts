@@ -357,6 +357,7 @@ async function handleJoinRoom(socket: SfuSocket, userId: string, roomId: string,
         producers: new Map(),
         transports: new Map(),
         room: room,
+        closed: false,
         isMuted: payload.isMuted,
         isDeafened: payload.isDeafened
     };
@@ -392,6 +393,14 @@ async function handleCreateTransport({ socket, peer, room }: HandlerContext) {
         ],
     });
 
+    // The peer can be closed while this awaited, e.g. replaced by a newer session from another socket's queue,
+    // which the per-socket queue can't order against. Its cleanup has already run, so nothing else would ever
+    // close this transport (or free its UDP port).
+    if (peer.closed) {
+        transport.close();
+        return null;
+    }
+
     // Fires on every close path (explicit close, router closed), so maps are only ever cleaned here.
     peer.transports.set(transport.id, transport);
     transport.observer.once('close', () => peer.transports.delete(transport.id));
@@ -422,6 +431,13 @@ async function handleProduce({ peer, room, socket }: HandlerContext, payload: Cr
     }
 
     const producer = await transport.produce({ kind: payload.kind, rtpParameters: payload.rtpParameters as RtpParameters, paused: payload.paused, appData: payload.appData });
+    // Same as handleCreateTransport. mediasoup doesn't re-check after its own await either: a transport closed
+    // mid-request still returns a producer, which would otherwise never be closed or announced as gone.
+    if (peer.closed) {
+        producer.close();
+        return null;
+    }
+
     room.producers.set(producer.id, { producer: producer, userId: peer.userId });
     peer.producers.set(producer.id, producer);
 
@@ -454,6 +470,11 @@ async function handleConsume({ socket, peer, room }: HandlerContext, payload: Cr
     if (!room.router.canConsume({ producerId: payload.producerId, rtpCapabilities: payload.rtpCapabilities })) return null;
 
     const consumer = await transport.consume({ producerId: payload.producerId, rtpCapabilities: payload.rtpCapabilities, paused: false, appData: producer.producer.appData });
+    // Same as handleCreateTransport and handleProduce.
+    if (peer.closed) {
+        consumer.close();
+        return null;
+    }
 
     // Fires on every close path, including the producer or this peer's transport closing.
     peer.consumers.set(consumer.id, consumer);
@@ -550,11 +571,17 @@ async function handleCloseClient(socket: SfuSocket, reason: 'left' | 'dropped') 
 
     const peer = peers.get(socketId);
     if (!peer) return;
+    peer.closed = true;
 
     // Every producer and consumer lives on one of the peer's transports, so closing those closes everything; the
-    // observer 'close' listeners clean the maps and tell the room about each closed producer.
+    // observer 'close' listeners clean the maps and tell the room about each closed producer. A failing close is
+    // logged rather than thrown, so it can't skip the other transports or the steps below.
     for (const transport of Array.from(peer.transports.values())) {
-        transport.close();
+        try {
+            transport.close();
+        } catch (error) {
+            console.error('closing transport', socketId, transport.id, error);
+        }
     }
 
     removePeer(socketId, peer);

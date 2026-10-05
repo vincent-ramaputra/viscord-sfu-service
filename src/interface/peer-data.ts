@@ -10,6 +10,8 @@ export interface PeerData {
     consumers: Map<string, Consumer>;
     producers: Map<string, Producer<ProducerAppData>>;
     room: Room;
+    // Set once handleCloseClient starts; handlers check it after each await that creates a mediasoup object.
+    closed: boolean;
     isMuted: boolean;
     isDeafened: boolean;
 }
