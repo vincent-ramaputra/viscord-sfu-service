@@ -2,22 +2,27 @@ import 'dotenv/config';
 import { Server, Socket } from "socket.io";
 import * as mediasoup from "mediasoup";
 import { Room } from "./interface/room";
-import { Worker } from "mediasoup/types";
+import { DtlsParameters, RtpParameters, Worker } from "mediasoup/types";
 import { CONNECT_TRANSPORT, CREATE_CONSUMER, CREATE_TRANSPORT, CLOSE_SFU_CLIENT, JOIN_ROOM, CREATE_PRODUCER, RESUME_CONSUMER, PAUSE_CONSUMER, GET_PRODUCERS, PRODUCER_JOINED, ACTIVE_SPEAKER_STATE, VOICE_MUTE, RESUME_PRODUCER, PAUSE_PRODUCER, CLOSE_PRODUCER, CLOSE_CONSUMER, SESSION_REPLACED } from "./const/events";
-import { ConnectTransportDTO } from "./dto/connect-transport.dto";
-import { CreateProducerDTO } from "./dto/create-producer.dto";
-import { CreateConsumerDTO } from "./dto/create-consumer.dto";
 import { CLOCK_TOLERANCE_S, ROUTER_CONFIG } from "./const/configs";
 import { PeerData } from "./interface/peer-data";
 import { createServer } from "http";
 import { ProducerCreatedDTO } from "./dto/producer-created.dto";
-import { ActiveSpeakerState as ActiveSpeakerStateDTO } from "./dto/active-speaker-state.dto";
 import { errors, importSPKI, jwtVerify } from 'jose';
-import { TicketClaims } from './schemas/ticket-claims.schema';
+import { TicketClaimsSchema } from './schemas/ticket-claims.schema';
 import { JoinRoom, JoinRoomSchema } from './schemas/join-room.schema';
 import { connect, publish } from './events/publisher';
 import { randomUUID } from 'crypto';
 import { CLEAR_JTI_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, SNAPSHOT_INTERVAL_MS } from './const/time';
+import z from 'zod';
+import { ConnectTransport, ConnectTransportSchema } from './schemas/connect-transport.schema';
+import { CreateProducer, CreateProducerSchema } from './schemas/create-producer.schema';
+import { CreateConsumer, CreateConsumerSchema } from './schemas/create-consumer.schema';
+import { PauseProducer, PauseProducerSchema } from './schemas/pause-producer.schema';
+import { ResumeProducer, ResumeProducerSchema } from './schemas/resume-producer.schema';
+import { ActiveSpeakerState, ActiveSpeakerStateSchema } from './schemas/active-speaker-state.schema';
+import { CloseProducer, CloseProducerSchema } from './schemas/close-producer.schema';
+import { CloseConsumer, CloseConsumerSchema } from './schemas/close-consumer.schema';
 
 if (!process.env.SFU_INSTANCE) {
     throw new Error("SFU_INSTANCE env is required");
@@ -121,7 +126,7 @@ io.use(async (socket, next) => {
             clockTolerance: CLOCK_TOLERANCE_S
         });
 
-        const ticketClaims = TicketClaims.safeParse(payload);
+        const ticketClaims = TicketClaimsSchema.safeParse(payload);
         if (!ticketClaims.success) {
             console.error('Failed parsing ticket claims', ticketClaims.error);
             return next(new Error('Unauthorized'));
@@ -154,32 +159,70 @@ io.use(async (socket, next) => {
 })
 
 io.on('connection', (socket: Socket) => {
-    let currentRoomId: string;
     let state: 'none' | 'joining' | 'joined' = 'none';
-    socket.on(JOIN_ROOM, async (payload: unknown, callback) => {
-        if (typeof callback !== 'function') return;
 
-        const userId = socket.data.userId;
-        const channelId = socket.data.channelId;
-        currentRoomId = channelId;
+    const onRequest = <S extends z.ZodType>(
+        event: string,
+        schema: S,
+        handler: (payload: z.output<S>) => Promise<unknown>,
+        options: { requireJoin: boolean } = { requireJoin: true }
+    ) => {
+        socket.on(event, async (...args: unknown[]) => {
+            const ack = args.at(-1);
+            if (typeof ack !== 'function') return;
+            if (options.requireJoin && state !== 'joined') {
+                ack(null);
+                return;
+            }
 
-        if (state !== 'none') {
-            callback(null);
-            return;
-        }
+            const raw = args.length > 1 ? args[0] : undefined;
+            const parsed = schema.safeParse(raw);
+            if (!parsed.success) {
+                console.warn(event, socket.id, parsed.error, 'invalid payload')
+                ack(null);
+                return;
+            }
 
-        const joinRoomSchema = JoinRoomSchema.safeParse(payload);
-        if (!joinRoomSchema.success) {
-            callback(null);
-            return;
-        }
+            try {
+                ack(await handler(parsed.data) ?? null);
+            } catch (error) {
+                console.error(event, socket.id, error);
+                ack(null);
+            }
+        });
+    }
+
+    const onSend = <S extends z.ZodType>(
+        event: string,
+        schema: S,
+        handler: (payload: z.output<S>) => Promise<unknown>
+    ) => {
+        socket.on(event, async (...args: unknown[]) => {
+            if (state !== 'joined') return;
+
+            const raw = args.length > 0 ? args[0] : undefined;
+            const parsed = schema.safeParse(raw);
+            if (!parsed.success) {
+                console.warn(event, socket.id, parsed.error, 'invalid payload')
+                return;
+            }
+
+            try {
+                await handler(parsed.data);
+            } catch (error) {
+                console.error(event, socket.id, error);
+            }
+        });
+    }
+
+    onRequest(JOIN_ROOM, JoinRoomSchema, async (payload) => {
+        if (state !== 'none') return null;
 
         state = 'joining';
-        const result = await handleJoinRoom(socket, userId, currentRoomId, joinRoomSchema.data);
+        const result = await handleJoinRoom(socket, socket.data.userId, socket.data.channelId, payload);
         if (result === null) {
             socket.disconnect();
-            callback(null);
-            return;
+            throw new Error('Failed joining room');
         }
         if (socket.disconnected) {
             peers.delete(socket.id);
@@ -188,75 +231,39 @@ io.on('connection', (socket: Socket) => {
         state = 'joined';
 
         publish('peer_joined', {
-            userId,
-            channelId,
+            userId: socket.data.userId,
+            channelId: socket.data.channelId,
             sessionId: socket.data.sessionId,
             bootId,
             sfuInstance,
             at: Date.now(),
-            isDeafened: joinRoomSchema.data.isDeafened,
-            isMuted: joinRoomSchema.data.isMuted
+            isDeafened: payload.isDeafened,
+            isMuted: payload.isMuted
         });
 
         // After peer_joined on purpose: guild-service stores the new session first, so the old one's peer_left is
-        // stale and nobody sees a leave and rejoin.
-        await replacePreviousSession(userId, socket);
+        // stale and nobody sees a leave and rejoin
+        await replacePreviousSession(socket.data.userId, socket);
 
-        callback(result);
-    });
-    // Every handler below needs the room and peer that JOIN_ROOM creates. Before that (or while it is
-    // still awaiting createRouter) rooms.get(currentRoomId) is undefined, so reject instead of crashing.
-    socket.on(CREATE_TRANSPORT, async (callback) => {
-        if (state !== 'joined') return callback(null);
-        callback(await handleCreateTransport(currentRoomId, socket));
-    });
-    socket.on(CONNECT_TRANSPORT, async (payload: ConnectTransportDTO, callback) => {
-        if (state !== 'joined') return callback(null);
-        callback(await handleConnectTranport(currentRoomId, payload));
-    });
-    socket.on(CREATE_PRODUCER, async (payload: CreateProducerDTO, callback) => {
-        if (state !== 'joined') return callback(null);
-        callback(await handleProduce(currentRoomId, socket, payload));
-    });
-    socket.on(CREATE_CONSUMER, async (payload: CreateConsumerDTO, callback) => {
-        if (state !== 'joined') return callback(null);
-        callback(await handleConsume(currentRoomId, payload, socket));
-    });
-    socket.on(GET_PRODUCERS, async (callback) => {
-        if (state !== 'joined') return callback(null);
-        callback(await getProducers(currentRoomId));
-    });
-    socket.on(RESUME_CONSUMER, async () => {
-        if (state !== 'joined') return;
-        await handleResumeConsumer(currentRoomId, socket);
-    });
-    socket.on(PAUSE_CONSUMER, async () => {
-        if (state !== 'joined') return;
-        await handlePauseConsumer(currentRoomId, socket);
-    });
-    socket.on(PAUSE_PRODUCER, async ({ producerId }: { producerId: string }) => {
-        if (state !== 'joined') return;
-        await handlePauseProducer(currentRoomId, producerId, socket);
-    });
-    socket.on(RESUME_PRODUCER, async ({ producerId }: { producerId: string }) => {
-        if (state !== 'joined') return;
-        await handleResumeProducer(currentRoomId, producerId, socket);
-    });
-    socket.on(ACTIVE_SPEAKER_STATE, async (payload: ActiveSpeakerStateDTO) => {
-        if (state !== 'joined') return;
-        await handleUpdateActiveSpeakerState(currentRoomId, socket, payload);
-    });
-    socket.on(CLOSE_PRODUCER, async ({ producerId }: { producerId: string }) => {
-        if (state !== 'joined') return;
-        await handleCloseProducer(currentRoomId, producerId, socket);
-    });
-    socket.on(CLOSE_CONSUMER, async ({ consumerId }: { consumerId: string }) => {
-        if (state !== 'joined') return;
-        handleCloseConsumer(currentRoomId, consumerId, socket);
-    });
-    // Cleanup is deliberately unguarded: it must run in any state, and handleCloseClient returns early when there is no peer.
-    socket.on(CLOSE_SFU_CLIENT, async () => await handleCloseClient(currentRoomId, socket, 'left'));
-    socket.on('disconnect', async (reason) => await handleCloseClient(currentRoomId, socket, reason === 'client namespace disconnect' ? 'left' : 'dropped'));
+        return result;
+    }, { requireJoin: false });
+
+    onRequest(CREATE_TRANSPORT, z.undefined(), async () => await handleCreateTransport(socket.data.channelId, socket));
+    onRequest(CONNECT_TRANSPORT, ConnectTransportSchema, async (payload) => await handleConnectTranport(socket.data.channelId, payload));
+    onRequest(CREATE_PRODUCER, CreateProducerSchema, async (payload) => await handleProduce(socket.data.channelId, socket, payload));
+    onRequest(CREATE_CONSUMER, CreateConsumerSchema, async (payload) => await handleConsume(socket.data.channelId, payload, socket));
+    onRequest(GET_PRODUCERS, z.undefined(), async () => await getProducers(socket.data.channelId));
+
+    onSend(RESUME_CONSUMER, z.undefined(), async () => await handleResumeConsumer(socket.data.channelId, socket));
+    onSend(PAUSE_CONSUMER, z.undefined(), async () => await handlePauseConsumer(socket.data.channelId, socket));
+    onSend(PAUSE_PRODUCER, PauseProducerSchema, async (payload) => await handlePauseProducer(socket.data.channelId, payload, socket));
+    onSend(RESUME_PRODUCER, ResumeProducerSchema, async (payload) => await handleResumeProducer(socket.data.channelId, payload, socket));
+    onSend(ACTIVE_SPEAKER_STATE, ActiveSpeakerStateSchema, async (payload) => await handleUpdateActiveSpeakerState(socket.data.channelId, socket, payload));
+    onSend(CLOSE_PRODUCER, CloseProducerSchema, async (payload) => await handleCloseProducer(socket.data.channelId, payload, socket));
+    onSend(CLOSE_CONSUMER, CloseConsumerSchema, async (payload) => await handleCloseConsumer(socket.data.channelId, payload, socket));
+    onSend(CLOSE_SFU_CLIENT, z.undefined(), async () => await handleCloseClient(socket.data.channelId, socket, 'left'));
+
+    socket.on('disconnect', async (reason) => await handleCloseClient(socket.data.channelId, socket, reason === 'client namespace disconnect' ? 'left' : 'dropped'));
     socket.on('reconnect', async () => console.log('client reconnects'))
 });
 
@@ -293,7 +300,7 @@ async function handleJoinRoom(socket: Socket, userId: string, roomId: string, pa
     return { rtpCapabilities: room.router.rtpCapabilities };
 }
 
-async function handleUpdateActiveSpeakerState(roomId: string, socket: Socket, payload: ActiveSpeakerStateDTO) {
+async function handleUpdateActiveSpeakerState(roomId: string, socket: Socket, payload: ActiveSpeakerState) {
     const peer = peers.get(socket.id);
     if (!peer) return null;
 
@@ -328,24 +335,24 @@ async function handleCreateTransport(roomId: string, socket: Socket) {
     });
 }
 
-async function handleConnectTranport(roomId: string, payload: ConnectTransportDTO) {
+async function handleConnectTranport(roomId: string, payload: ConnectTransport) {
     const room = rooms.get(roomId)!;
 
     const transport = room.transports.get(payload.transportId);
     if (!transport) return null;
 
-    await transport.connect({ dtlsParameters: payload.dtlsParameters });
+    await transport.connect({ dtlsParameters: payload.dtlsParameters as DtlsParameters });
     return true;
 }
 
-async function handleProduce(roomId: string, socket: Socket, payload: CreateProducerDTO) {
+async function handleProduce(roomId: string, socket: Socket, payload: CreateProducer) {
     const room = rooms.get(roomId)!;
     const transport = room.transports.get(payload.transportId);
     const peer = peers.get(socket.id);
 
     if (!transport || !peer) return null;
 
-    const producer = await transport.produce({ kind: payload.kind, rtpParameters: payload.rtpParameters, paused: payload.paused, appData: payload.appData });
+    const producer = await transport.produce({ kind: payload.kind, rtpParameters: payload.rtpParameters as RtpParameters, paused: payload.paused, appData: payload.appData });
     console.log('producer appdata', producer.appData);
     room.producers.set(producer.id, { producer: producer, userId: peer.userId });
     peer.producers.set(producer.id, producer);
@@ -355,7 +362,7 @@ async function handleProduce(roomId: string, socket: Socket, payload: CreateProd
     return { id: producer.id };
 }
 
-async function handleConsume(roomId: string, payload: CreateConsumerDTO, socket: Socket) {
+async function handleConsume(roomId: string, payload: CreateConsumer, socket: Socket) {
     const room = rooms.get(roomId)!;
     const transport = room.transports.get(payload.transportId);
     const producer = room.producers.get(payload.producerId);
@@ -411,9 +418,9 @@ async function handlePauseConsumer(roomId: string, socket: Socket) {
     return true;
 }
 
-async function handlePauseProducer(roomId: string, producerId: string, socket: Socket) {
+async function handlePauseProducer(roomId: string, payload: PauseProducer, socket: Socket) {
     const room = rooms.get(roomId);
-    const producer = room?.producers.get(producerId);
+    const producer = room?.producers.get(payload.producerId);
     if (!producer) return;
     await producer.producer.pause();
 
@@ -422,9 +429,9 @@ async function handlePauseProducer(roomId: string, producerId: string, socket: S
 }
 
 
-async function handleResumeProducer(roomId: string, producerId: string, socket: Socket) {
+async function handleResumeProducer(roomId: string, payload: ResumeProducer, socket: Socket) {
     const room = rooms.get(roomId)!;
-    const producer = room?.producers.get(producerId);
+    const producer = room?.producers.get(payload.producerId);
     if (!producer) return;
     await producer.producer.resume();
 
@@ -497,9 +504,9 @@ async function getProducers(roomId: string) {
     return { producers: Array.from(room.producers.values()).map(p => ({ userId: p.userId, producerId: p.producer.id })) };
 }
 
-async function handleCloseProducer(roomId: string, producerId: string, socket: Socket) {
+async function handleCloseProducer(roomId: string, payload: CloseProducer, socket: Socket) {
     const room = rooms.get(roomId)!;
-    const producer = room.producers.get(producerId);
+    const producer = room.producers.get(payload.producerId);
     if (!producer) return;
 
     const consumers = Array.from(room.consumers.values()).filter(c => c.producerId === producer?.producer.id);
@@ -511,21 +518,25 @@ async function handleCloseProducer(roomId: string, producerId: string, socket: S
     producer.producer.close();
     room.producers.delete(producer.producer.id);
 
-    socket.broadcast.to(roomId).emit(CLOSE_PRODUCER, { producerId });
+    socket.broadcast.to(roomId).emit(CLOSE_PRODUCER, { producerId: payload.producerId });
 }
 
-function handleCloseConsumer(roomId: string, consumerId: string, socket: Socket) {
-    console.log('closing consumer', consumerId);
+function handleCloseConsumer(roomId: string, payload: CloseConsumer, socket: Socket) {
+    console.log('closing consumer', payload.consumerId);
     const peer = peers.get(socket.id);
     const room = rooms.get(roomId)!;
     if (!peer) return;
 
-    const consumer = peer.consumers.get(consumerId);
+    const consumer = peer.consumers.get(payload.consumerId);
     if (!consumer?.closed) consumer?.close();
 
-    peer.consumers.delete(consumerId);
-    room.consumers.delete(consumerId);
+    peer.consumers.delete(payload.consumerId);
+    room.consumers.delete(payload.consumerId);
 }
+
+process.on('unhandledRejection', (reason) => {
+    console.error('unhandled rejection', reason);
+})
 
 
 process.on("SIGTERM", () => {
