@@ -39,7 +39,7 @@ const io: SfuServer = new Server(server, {
 const bootId = randomUUID();
 const sfuInstance: string = process.env.SFU_INSTANCE;
 
-const rooms = new Map<string, Room>();
+const rooms = new Map<string, Promise<Room>>();
 const peers = new Map<string, PeerData>();
 // userId → socket.id of that user's current peer on this SFU. One voice session per user: a new join replaces the old one.
 const socketByUser = new Map<string, string>();
@@ -175,10 +175,9 @@ io.on('connection', (socket) => {
         if (state !== 'joined' || !socket.connected) return undefined;
 
         const peer = peers.get(socket.id);
-        const room = peer && rooms.get(peer.channelId);
-        if (!peer || !room) return undefined;
+        if (!peer) return undefined;
 
-        return { socket, peer, room };
+        return { socket, peer, room: peer.room };
     };
 
     const onRequest = <S extends z.ZodType>(
@@ -258,6 +257,8 @@ io.on('connection', (socket) => {
             ack(await joinRoom(parsed.data) ?? null);
         } catch (error) {
             console.error(JOIN_ROOM, socket.id, error);
+            // Without this the socket would stay in 'joining', where every event (JOIN_ROOM included) is rejected.
+            socket.disconnect();
             ack(null);
         }
     }));
@@ -265,12 +266,11 @@ io.on('connection', (socket) => {
     const joinRoom = async (payload: JoinRoom) => {
         state = 'joining';
         const result = await handleJoinRoom(socket, socket.data.userId, socket.data.channelId, payload);
-        if (result === null) {
-            socket.disconnect();
-            throw new Error('Failed joining room');
-        }
+        // Disconnected while joining: leave the room here (the peer has no transports yet), so the queued disconnect
+        // cleanup finds no peer and publishes no peer_left for a join that never published peer_joined.
         if (socket.disconnected) {
-            peers.delete(socket.id);
+            const peer = peers.get(socket.id);
+            if (peer) removePeer(socket.id, peer);
             return;
         }
         state = 'joined';
@@ -317,34 +317,53 @@ io.on('connection', (socket) => {
     }));
 });
 
+async function createRoom(): Promise<Room> {
+    const router = await worker.createRouter(ROUTER_CONFIG);
+    return { router, producers: new Map(), peers: new Map() };
+}
+
+// Not async on purpose: nothing here yields, so the promise is in the map before any other join can look.
+function getOrCreateRoom(channelId: string): Promise<Room> {
+    const existing = rooms.get(channelId);
+    if (existing) return existing;
+
+    const created = createRoom();          // starts creating; doesn't wait
+    rooms.set(channelId, created);         // reserve the channel immediately
+
+    // A failed creation must not stay cached, or every later join to this channel fails with the same error.
+    created.catch(() => {
+        if (rooms.get(channelId) === created) rooms.delete(channelId);
+    });
+
+    return created;
+}
+
 async function handleJoinRoom(socket: SfuSocket, userId: string, roomId: string, payload: JoinRoom) {
     socket.join(roomId);
 
-    if (!rooms.has(roomId)) {
-        try {
-            const router = await worker.createRouter(ROUTER_CONFIG);
-            rooms.set(roomId, {
-                router,
-                producers: new Map(),
-            });
-        } catch (error) {
-            console.error(error)
-            return null;
-        }
-    }
+    // The last peer can leave and close the room while this join awaits it; removePeer drops the closed room from
+    // `rooms` first, so asking again yields a fresh one.
+    let room: Room;
+    do {
+        room = await getOrCreateRoom(roomId);
+    } while (room.router.closed);
 
-    peers.set(socket.id, {
+    // Added synchronously after the await, so the room can't be emptied and closed under this peer from here on.
+    const peerData: PeerData = {
         userId: userId,
         channelId: roomId,
         sessionId: socket.data.sessionId,
         consumers: new Map(),
         producers: new Map(),
         transports: new Map(),
+        room: room,
         isMuted: payload.isMuted,
         isDeafened: payload.isDeafened
-    });
+    };
 
-    const room = rooms.get(roomId)!;
+    room.peers.set(socket.id, peerData);
+    peers.set(socket.id, peerData);
+
     return { rtpCapabilities: room.router.rtpCapabilities };
 }
 
@@ -385,7 +404,7 @@ async function handleCreateTransport({ socket, peer, room }: HandlerContext) {
     });
 }
 
-async function handleConnectTransport({peer}: HandlerContext, payload: ConnectTransport) {
+async function handleConnectTransport({ peer }: HandlerContext, payload: ConnectTransport) {
     const transport = peer.transports.get(payload.transportId);
     if (!transport) return null;
 
@@ -393,7 +412,7 @@ async function handleConnectTransport({peer}: HandlerContext, payload: ConnectTr
     return true;
 }
 
-async function handleProduce({peer, room, socket}: HandlerContext, payload: CreateProducer) {
+async function handleProduce({ peer, room, socket }: HandlerContext, payload: CreateProducer) {
     const transport = peer.transports.get(payload.transportId);
     if (!transport) return null;
 
@@ -509,6 +528,23 @@ async function replacePreviousSession(userId: string, socket: SfuSocket) {
     await handleCloseClient(previousSocket, 'left');
 }
 
+/**
+ * Removes the peer from both indexes and closes its room if it was the last one in it. The only place either index
+ * loses a peer, so they can't drift apart.
+ */
+function removePeer(socketId: string, peer: PeerData) {
+    peers.delete(socketId);
+    peer.room.peers.delete(socketId);
+
+    if (peer.room.peers.size === 0) {
+        // Deleting by channelId can't hit a newer room for the same channel: a room reaches zero peers only once,
+        // because the join loop in handleJoinRoom never adds a peer to a closed room. Removed from the map before
+        // closing, so a join retrying in that loop gets a fresh room.
+        rooms.delete(peer.channelId);
+        peer.room.router.close();
+    }
+}
+
 async function handleCloseClient(socket: SfuSocket, reason: 'left' | 'dropped') {
     const socketId = socket.id;
 
@@ -521,7 +557,7 @@ async function handleCloseClient(socket: SfuSocket, reason: 'left' | 'dropped') 
         transport.close();
     }
 
-    peers.delete(socketId);
+    removePeer(socketId, peer);
     // Only if it still points here: when a replaced session is closed, the index already points to the new one.
     if (socketByUser.get(peer.userId) === socketId) socketByUser.delete(peer.userId);
     socket.disconnect();
