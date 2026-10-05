@@ -22,6 +22,8 @@ import { ResumeProducer, ResumeProducerSchema } from './schemas/resume-producer.
 import { ActiveSpeakerState, ActiveSpeakerStateSchema } from './schemas/active-speaker-state.schema';
 import { CloseProducer, CloseProducerSchema } from './schemas/close-producer.schema';
 import { CloseConsumer, CloseConsumerSchema } from './schemas/close-consumer.schema';
+import { PauseConsumer, PauseConsumerSchema } from './schemas/pause-consumer.schema';
+import { ResumeConsumer, ResumeConsumerSchema } from './schemas/resume-consumer.schema';
 import { SfuServer, SfuSocket } from './interface/socket-protocol';
 import { HandlerContext } from './interface/handler-context';
 
@@ -299,8 +301,8 @@ io.on('connection', (socket) => {
     onRequest(CREATE_CONSUMER, CreateConsumerSchema, handleConsume);
     onRequest(GET_PRODUCERS, z.undefined(), getProducers);
 
-    onSend(RESUME_CONSUMER, z.undefined(), handleResumeConsumer);
-    onSend(PAUSE_CONSUMER, z.undefined(), handlePauseConsumer);
+    onSend(RESUME_CONSUMER, ResumeConsumerSchema, handleResumeConsumer);
+    onSend(PAUSE_CONSUMER, PauseConsumerSchema, handlePauseConsumer);
     onSend(PAUSE_PRODUCER, PauseProducerSchema, handlePauseProducer);
     onSend(RESUME_PRODUCER, ResumeProducerSchema, handleResumeProducer);
     onSend(ACTIVE_SPEAKER_STATE, ActiveSpeakerStateSchema, handleUpdateActiveSpeakerState);
@@ -483,30 +485,18 @@ async function handleConsume({ socket, peer, room }: HandlerContext, payload: Cr
     return { id: consumer.id, producerId: payload.producerId, kind: consumer.kind, rtpParameters: consumer.rtpParameters, appData: consumer.appData };
 }
 
-async function handleResumeConsumer({ peer }: HandlerContext) {
-    const promises = [];
-
-    try {
-        for (const consumer of Array.from(peer.consumers.values())) {
-            promises.push(consumer.resume());
-        }
-        await Promise.all(promises);
-    } catch (error) {
-        console.log("error resruming", peer.consumers.size);
-    }
-
+async function handleResumeConsumer({ peer }: HandlerContext, payload: ResumeConsumer) {
+    const consumer = peer.consumers.get(payload.consumerId);
+    if (!consumer) return;
+    await consumer.resume();
 
     return true;
 }
 
-async function handlePauseConsumer({ peer }: HandlerContext) {
-    const promises = [];
-    for (const consumer of Array.from(peer.consumers.values())) {
-        promises.push(consumer.pause());
-    }
-
-    await Promise.all(promises);
-
+async function handlePauseConsumer({ peer }: HandlerContext, payload: PauseConsumer) {
+    const consumer = peer.consumers.get(payload.consumerId);
+    if (!consumer) return;
+    await consumer.pause();
 
     return true;
 }
