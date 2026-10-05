@@ -1,8 +1,10 @@
-import { number, object, uuid } from "zod";
+import z from "zod";
 
-export const TicketClaims = object({
-    sub: uuid(),
-    channelId: uuid(),
-    jti: uuid(),
-    exp: number(),
-})
+export const TicketClaimsSchema = z.object({
+    sub: z.uuid(),
+    channelId: z.uuid(),
+    jti: z.uuid(),
+    exp: z.number(),
+});
+
+export type TicketClaims = z.infer<typeof TicketClaimsSchema>;
