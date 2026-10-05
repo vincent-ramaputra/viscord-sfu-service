@@ -37,3 +37,4 @@ export const ROUTER_CONFIG: RouterOptions = {
 };
 
 export const CLOCK_TOLERANCE_S = 5;
+export const MAX_TRANSPORTS_PER_PEER = 2;

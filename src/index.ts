@@ -4,7 +4,7 @@ import * as mediasoup from "mediasoup";
 import { Room } from "./interface/room";
 import { DtlsParameters, RtpParameters, Worker } from "mediasoup/types";
 import { CONNECT_TRANSPORT, CREATE_CONSUMER, CREATE_TRANSPORT, CLOSE_SFU_CLIENT, JOIN_ROOM, CREATE_PRODUCER, RESUME_CONSUMER, PAUSE_CONSUMER, GET_PRODUCERS, PRODUCER_JOINED, ACTIVE_SPEAKER_STATE, RESUME_PRODUCER, PAUSE_PRODUCER, CLOSE_PRODUCER, CLOSE_CONSUMER, SESSION_REPLACED } from "./const/events";
-import { CLOCK_TOLERANCE_S, ROUTER_CONFIG } from "./const/configs";
+import { CLOCK_TOLERANCE_S, MAX_TRANSPORTS_PER_PEER, ROUTER_CONFIG } from "./const/configs";
 import { PeerData } from "./interface/peer-data";
 import { createServer } from "http";
 import { errors, importSPKI, jwtVerify } from 'jose';
@@ -23,6 +23,7 @@ import { ActiveSpeakerState, ActiveSpeakerStateSchema } from './schemas/active-s
 import { CloseProducer, CloseProducerSchema } from './schemas/close-producer.schema';
 import { CloseConsumer, CloseConsumerSchema } from './schemas/close-consumer.schema';
 import { SfuServer, SfuSocket } from './interface/socket-protocol';
+import { HandlerContext } from './interface/handler-context';
 
 if (!process.env.SFU_INSTANCE) {
     throw new Error("SFU_INSTANCE env is required");
@@ -158,17 +159,39 @@ io.use(async (socket, next) => {
 
 io.on('connection', (socket) => {
     let state: 'none' | 'joining' | 'joined' = 'none';
+    let queue: Promise<unknown> = Promise.resolve();
+
+    // Every event from this socket (disconnect included) runs one at a time, so a handler's check, await, then write
+    // can't interleave with another event from the same peer: the per-peer caps rely on this, and cleanup waits for
+    // an in-flight request instead of missing what it creates. fn must not reject (each one catches its own errors);
+    // a task that never settles would stall this socket's events, cleanup included.
+    const serialize = (fn: () => Promise<unknown>) => (queue = queue.then(fn, fn));
+
+    // Undefined before JOIN_ROOM has finished, and again once the socket disconnected or the peer is closed (left,
+    // dropped, or replaced by a newer session of the same user), so events in either window are rejected instead of
+    // reaching a handler. The disconnect check also lets cleanup run right after an in-flight event, not after
+    // everything queued behind it.
+    const resolveContext = (): HandlerContext | undefined => {
+        if (state !== 'joined' || !socket.connected) return undefined;
+
+        const peer = peers.get(socket.id);
+        const room = peer && rooms.get(peer.channelId);
+        if (!peer || !room) return undefined;
+
+        return { socket, peer, room };
+    };
 
     const onRequest = <S extends z.ZodType>(
         event: string,
         schema: S,
-        handler: (payload: z.output<S>) => Promise<unknown>,
-        options: { requireJoin: boolean } = { requireJoin: true }
+        handler: (ctx: HandlerContext, payload: z.output<S>) => unknown
     ) => {
-        socket.on(event, async (...args: unknown[]) => {
+        socket.on(event, (...args: unknown[]) => serialize(async () => {
             const ack = args.at(-1);
             if (typeof ack !== 'function') return;
-            if (options.requireJoin && state !== 'joined') {
+
+            const ctx = resolveContext();
+            if (!ctx) {
                 ack(null);
                 return;
             }
@@ -182,21 +205,22 @@ io.on('connection', (socket) => {
             }
 
             try {
-                ack(await handler(parsed.data) ?? null);
+                ack(await handler(ctx, parsed.data) ?? null);
             } catch (error) {
                 console.error(event, socket.id, error);
                 ack(null);
             }
-        });
+        }));
     }
 
     const onSend = <S extends z.ZodType>(
         event: string,
         schema: S,
-        handler: (payload: z.output<S>) => Promise<unknown>
+        handler: (ctx: HandlerContext, payload: z.output<S>) => unknown
     ) => {
-        socket.on(event, async (...args: unknown[]) => {
-            if (state !== 'joined') return;
+        socket.on(event, (...args: unknown[]) => serialize(async () => {
+            const ctx = resolveContext();
+            if (!ctx) return;
 
             const raw = args.length > 0 ? args[0] : undefined;
             const parsed = schema.safeParse(raw);
@@ -206,16 +230,39 @@ io.on('connection', (socket) => {
             }
 
             try {
-                await handler(parsed.data);
+                await handler(ctx, parsed.data);
             } catch (error) {
                 console.error(event, socket.id, error);
             }
-        });
+        }));
     }
 
-    onRequest(JOIN_ROOM, JoinRoomSchema, async (payload) => {
-        if (state !== 'none') return null;
+    // JOIN_ROOM creates the peer, so it can't go through onRequest, which needs one. Same ack/validation contract.
+    socket.on(JOIN_ROOM, (...args: unknown[]) => serialize(async () => {
+        const ack = args.at(-1);
+        if (typeof ack !== 'function') return;
+        if (state !== 'none') {
+            ack(null);
+            return;
+        }
 
+        const raw = args.length > 1 ? args[0] : undefined;
+        const parsed = JoinRoomSchema.safeParse(raw);
+        if (!parsed.success) {
+            console.warn(JOIN_ROOM, socket.id, parsed.error, 'invalid payload')
+            ack(null);
+            return;
+        }
+
+        try {
+            ack(await joinRoom(parsed.data) ?? null);
+        } catch (error) {
+            console.error(JOIN_ROOM, socket.id, error);
+            ack(null);
+        }
+    }));
+
+    const joinRoom = async (payload: JoinRoom) => {
         state = 'joining';
         const result = await handleJoinRoom(socket, socket.data.userId, socket.data.channelId, payload);
         if (result === null) {
@@ -244,24 +291,30 @@ io.on('connection', (socket) => {
         await replacePreviousSession(socket.data.userId, socket);
 
         return result;
-    }, { requireJoin: false });
+    };
 
-    onRequest(CREATE_TRANSPORT, z.undefined(), async () => await handleCreateTransport(socket.data.channelId, socket));
-    onRequest(CONNECT_TRANSPORT, ConnectTransportSchema, async (payload) => await handleConnectTranport(socket.data.channelId, payload));
-    onRequest(CREATE_PRODUCER, CreateProducerSchema, async (payload) => await handleProduce(socket.data.channelId, socket, payload));
-    onRequest(CREATE_CONSUMER, CreateConsumerSchema, async (payload) => await handleConsume(socket.data.channelId, payload, socket));
-    onRequest(GET_PRODUCERS, z.undefined(), async () => await getProducers(socket.data.channelId));
+    onRequest(CREATE_TRANSPORT, z.undefined(), handleCreateTransport);
+    onRequest(CONNECT_TRANSPORT, ConnectTransportSchema, handleConnectTransport);
+    onRequest(CREATE_PRODUCER, CreateProducerSchema, handleProduce);
+    onRequest(CREATE_CONSUMER, CreateConsumerSchema, handleConsume);
+    onRequest(GET_PRODUCERS, z.undefined(), getProducers);
 
-    onSend(RESUME_CONSUMER, z.undefined(), async () => await handleResumeConsumer(socket));
-    onSend(PAUSE_CONSUMER, z.undefined(), async () => await handlePauseConsumer(socket));
-    onSend(PAUSE_PRODUCER, PauseProducerSchema, async (payload) => await handlePauseProducer(socket.data.channelId, payload));
-    onSend(RESUME_PRODUCER, ResumeProducerSchema, async (payload) => await handleResumeProducer(socket.data.channelId, payload));
-    onSend(ACTIVE_SPEAKER_STATE, ActiveSpeakerStateSchema, async (payload) => await handleUpdateActiveSpeakerState(socket.data.channelId, socket, payload));
-    onSend(CLOSE_PRODUCER, CloseProducerSchema, async (payload) => await handleCloseProducer(socket.data.channelId, payload, socket));
-    onSend(CLOSE_CONSUMER, CloseConsumerSchema, async (payload) => await handleCloseConsumer(socket.data.channelId, payload, socket));
-    onSend(CLOSE_SFU_CLIENT, z.undefined(), async () => await handleCloseClient(socket.data.channelId, socket, 'left'));
+    onSend(RESUME_CONSUMER, z.undefined(), handleResumeConsumer);
+    onSend(PAUSE_CONSUMER, z.undefined(), handlePauseConsumer);
+    onSend(PAUSE_PRODUCER, PauseProducerSchema, handlePauseProducer);
+    onSend(RESUME_PRODUCER, ResumeProducerSchema, handleResumeProducer);
+    onSend(ACTIVE_SPEAKER_STATE, ActiveSpeakerStateSchema, handleUpdateActiveSpeakerState);
+    onSend(CLOSE_PRODUCER, CloseProducerSchema, handleCloseProducer);
+    onSend(CLOSE_CONSUMER, CloseConsumerSchema, handleCloseConsumer);
+    onSend(CLOSE_SFU_CLIENT, z.undefined(), ({ socket, peer }) => handleCloseClient(peer.channelId, socket, 'left'));
 
-    socket.on('disconnect', async (reason) => await handleCloseClient(socket.data.channelId, socket, reason === 'client namespace disconnect' ? 'left' : 'dropped'));
+    socket.on('disconnect', (reason) => serialize(async () => {
+        try {
+            await handleCloseClient(socket.data.channelId, socket, reason === 'client namespace disconnect' ? 'left' : 'dropped');
+        } catch (error) {
+            console.error('disconnect', socket.id, error);
+        }
+    }));
 });
 
 async function handleJoinRoom(socket: SfuSocket, userId: string, roomId: string, payload: JoinRoom) {
@@ -297,16 +350,17 @@ async function handleJoinRoom(socket: SfuSocket, userId: string, roomId: string,
     return { rtpCapabilities: room.router.rtpCapabilities };
 }
 
-async function handleUpdateActiveSpeakerState(roomId: string, socket: SfuSocket, payload: ActiveSpeakerState) {
-    const peer = peers.get(socket.id);
-    if (!peer) return null;
-
-    socket.broadcast.to(roomId).emit(ACTIVE_SPEAKER_STATE, { ...payload, userId: peer.userId });
+function handleUpdateActiveSpeakerState({ socket, peer }: HandlerContext, payload: ActiveSpeakerState) {
+    socket.broadcast.to(peer.channelId).emit(ACTIVE_SPEAKER_STATE, { ...payload, userId: peer.userId });
 }
 
-async function handleCreateTransport(roomId: string, socket: SfuSocket) {
-    const room = rooms.get(roomId)!;
-    const peer = peers.get(socket.id)!;
+async function handleCreateTransport({ socket, peer, room }: HandlerContext) {
+    // Checked before createWebRtcTransport: each transport reserves a UDP port from the shared RTC port range.
+    if (peer.transports.size >= MAX_TRANSPORTS_PER_PEER) {
+        console.warn('transport cap reached', socket.id);
+        return null;
+    }
+
     const transport = await room.router.createWebRtcTransport({
         enableUdp: true,
         enableTcp: true,
@@ -332,40 +386,44 @@ async function handleCreateTransport(roomId: string, socket: SfuSocket) {
     });
 }
 
-async function handleConnectTranport(roomId: string, payload: ConnectTransport) {
-    const room = rooms.get(roomId)!;
-
-    const transport = room.transports.get(payload.transportId);
+async function handleConnectTransport({peer}: HandlerContext, payload: ConnectTransport) {
+    const transport = peer.transports.get(payload.transportId);
     if (!transport) return null;
 
     await transport.connect({ dtlsParameters: payload.dtlsParameters as DtlsParameters });
     return true;
 }
 
-async function handleProduce(roomId: string, socket: SfuSocket, payload: CreateProducer) {
-    const room = rooms.get(roomId)!;
-    const transport = room.transports.get(payload.transportId);
-    const peer = peers.get(socket.id);
+async function handleProduce({peer, room, socket}: HandlerContext, payload: CreateProducer) {
+    const transport = peer.transports.get(payload.transportId);
+    if (!transport) return null;
 
-    if (!transport || !peer) return null;
+    if (Array.from(peer.producers.values()).some(p => p.appData.mediaTag === payload.appData.mediaTag)) {
+        console.warn('producer cap reached', socket.id, payload.appData.mediaTag);
+        return null;
+    }
 
     const producer = await transport.produce({ kind: payload.kind, rtpParameters: payload.rtpParameters as RtpParameters, paused: payload.paused, appData: payload.appData });
     console.log('producer appdata', producer.appData);
     room.producers.set(producer.id, { producer: producer, userId: peer.userId });
     peer.producers.set(producer.id, producer);
 
-    socket.broadcast.to(roomId).emit(PRODUCER_JOINED, { producerId: producer.id, userId: peer.userId });
+    socket.broadcast.to(peer.channelId).emit(PRODUCER_JOINED, { producerId: producer.id, userId: peer.userId });
 
     return { id: producer.id };
 }
 
-async function handleConsume(roomId: string, payload: CreateConsumer, socket: SfuSocket) {
-    const room = rooms.get(roomId)!;
-    const transport = room.transports.get(payload.transportId);
+async function handleConsume({ socket, peer, room }: HandlerContext, payload: CreateConsumer) {
+    const transport = peer.transports.get(payload.transportId);
     const producer = room.producers.get(payload.producerId);
-    const peer = peers.get(socket.id)!;
-
     if (!transport || !producer) return null;
+
+    // One live consumer per producer per peer: each consumer is another forwarded copy of the stream, so
+    // duplicates would let one client multiply the SFU's outgoing bandwidth.
+    if (Array.from(peer.consumers.values()).some(c => c.producerId === payload.producerId && !c.closed)) {
+        console.warn('consumer cap reached', socket.id, payload.producerId);
+        return null;
+    }
 
     if (!room.router.canConsume({ producerId: payload.producerId, rtpCapabilities: payload.rtpCapabilities })) return null;
 
@@ -376,14 +434,11 @@ async function handleConsume(roomId: string, payload: CreateConsumer, socket: Sf
     return { id: consumer.id, producerId: payload.producerId, kind: consumer.kind, rtpParameters: consumer.rtpParameters, appData: consumer.appData };
 }
 
-async function handleResumeConsumer(socket: SfuSocket) {
-    const peer = peers.get(socket.id);
-    if (!peer) return;
-
+async function handleResumeConsumer({ peer }: HandlerContext) {
     const promises = [];
 
     try {
-        for (const consumer of Array.from(peer?.consumers.values())) {
+        for (const consumer of Array.from(peer.consumers.values())) {
             promises.push(consumer.resume());
         }
         await Promise.all(promises);
@@ -395,12 +450,9 @@ async function handleResumeConsumer(socket: SfuSocket) {
     return true;
 }
 
-async function handlePauseConsumer(socket: SfuSocket) {
-    const peer = peers.get(socket.id);
-    if (!peer) return;
-
+async function handlePauseConsumer({ peer }: HandlerContext) {
     const promises = [];
-    for (const consumer of Array.from(peer?.consumers.values())) {
+    for (const consumer of Array.from(peer.consumers.values())) {
         promises.push(consumer.pause());
     }
 
@@ -410,21 +462,19 @@ async function handlePauseConsumer(socket: SfuSocket) {
     return true;
 }
 
-async function handlePauseProducer(roomId: string, payload: PauseProducer) {
-    const room = rooms.get(roomId);
-    const producer = room?.producers.get(payload.producerId);
+async function handlePauseProducer({ peer }: HandlerContext, payload: PauseProducer) {
+    const producer = peer.producers.get(payload.producerId);
     if (!producer) return;
-    await producer.producer.pause();
+    await producer.pause();
 
     return true;
 }
 
 
-async function handleResumeProducer(roomId: string, payload: ResumeProducer) {
-    const room = rooms.get(roomId)!;
-    const producer = room?.producers.get(payload.producerId);
+async function handleResumeProducer({ peer }: HandlerContext, payload: ResumeProducer) {
+    const producer = peer.producers.get(payload.producerId);
     if (!producer) return;
-    await producer.producer.resume();
+    await producer.resume();
 
     return true;
 }
@@ -489,34 +539,28 @@ async function handleCloseClient(roomId: string, socket: SfuSocket, reason: 'lef
     return true;
 }
 
-async function getProducers(roomId: string) {
-    const room = rooms.get(roomId)!;
+function getProducers({ room }: HandlerContext) {
     return { producers: Array.from(room.producers.values()).map(p => ({ userId: p.userId, producerId: p.producer.id })) };
 }
 
-async function handleCloseProducer(roomId: string, payload: CloseProducer, socket: SfuSocket) {
-    const room = rooms.get(roomId)!;
-    const producer = room.producers.get(payload.producerId);
+function handleCloseProducer({ socket, peer, room }: HandlerContext, payload: CloseProducer) {
+    const producer = peer.producers.get(payload.producerId);
     if (!producer) return;
 
-    const consumers = Array.from(room.consumers.values()).filter(c => c.producerId === producer?.producer.id);
+    const consumers = Array.from(room.consumers.values()).filter(c => c.producerId === producer.id);
 
     for (const consumer of consumers) {
         consumer.close();
         room.consumers.delete(consumer.id);
     }
-    producer.producer.close();
-    room.producers.delete(producer.producer.id);
+    producer.close();
+    room.producers.delete(producer.id);
+    peer.producers.delete(producer.id);
 
-    socket.broadcast.to(roomId).emit(CLOSE_PRODUCER, { producerId: payload.producerId });
+    socket.broadcast.to(peer.channelId).emit(CLOSE_PRODUCER, { producerId: payload.producerId });
 }
 
-function handleCloseConsumer(roomId: string, payload: CloseConsumer, socket: SfuSocket) {
-    console.log('closing consumer', payload.consumerId);
-    const peer = peers.get(socket.id);
-    const room = rooms.get(roomId)!;
-    if (!peer) return;
-
+function handleCloseConsumer({ peer, room }: HandlerContext, payload: CloseConsumer) {
     const consumer = peer.consumers.get(payload.consumerId);
     if (!consumer?.closed) consumer?.close();
 
