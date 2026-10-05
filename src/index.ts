@@ -365,16 +365,16 @@ async function handleCreateTransport({ peer, room }: HandlerContext) {
     });
 }
 
-async function handleConnectTransport({ room }: HandlerContext, payload: ConnectTransport) {
-    const transport = room.transports.get(payload.transportId);
+async function handleConnectTransport({peer}: HandlerContext, payload: ConnectTransport) {
+    const transport = peer.transports.get(payload.transportId);
     if (!transport) return null;
 
     await transport.connect({ dtlsParameters: payload.dtlsParameters as DtlsParameters });
     return true;
 }
 
-async function handleProduce({ socket, peer, room }: HandlerContext, payload: CreateProducer) {
-    const transport = room.transports.get(payload.transportId);
+async function handleProduce({peer, room, socket}: HandlerContext, payload: CreateProducer) {
+    const transport = peer.transports.get(payload.transportId);
     if (!transport) return null;
 
     const producer = await transport.produce({ kind: payload.kind, rtpParameters: payload.rtpParameters as RtpParameters, paused: payload.paused, appData: payload.appData });
@@ -388,7 +388,7 @@ async function handleProduce({ socket, peer, room }: HandlerContext, payload: Cr
 }
 
 async function handleConsume({ peer, room }: HandlerContext, payload: CreateConsumer) {
-    const transport = room.transports.get(payload.transportId);
+    const transport = peer.transports.get(payload.transportId);
     const producer = room.producers.get(payload.producerId);
     if (!transport || !producer) return null;
 
@@ -429,19 +429,19 @@ async function handlePauseConsumer({ peer }: HandlerContext) {
     return true;
 }
 
-async function handlePauseProducer({ room }: HandlerContext, payload: PauseProducer) {
-    const producer = room.producers.get(payload.producerId);
+async function handlePauseProducer({ peer }: HandlerContext, payload: PauseProducer) {
+    const producer = peer.producers.get(payload.producerId);
     if (!producer) return;
-    await producer.producer.pause();
+    await producer.pause();
 
     return true;
 }
 
 
-async function handleResumeProducer({ room }: HandlerContext, payload: ResumeProducer) {
-    const producer = room.producers.get(payload.producerId);
+async function handleResumeProducer({ peer }: HandlerContext, payload: ResumeProducer) {
+    const producer = peer.producers.get(payload.producerId);
     if (!producer) return;
-    await producer.producer.resume();
+    await producer.resume();
 
     return true;
 }
@@ -511,23 +511,23 @@ function getProducers({ room }: HandlerContext) {
 }
 
 function handleCloseProducer({ socket, peer, room }: HandlerContext, payload: CloseProducer) {
-    const producer = room.producers.get(payload.producerId);
+    const producer = peer.producers.get(payload.producerId);
     if (!producer) return;
 
-    const consumers = Array.from(room.consumers.values()).filter(c => c.producerId === producer?.producer.id);
+    const consumers = Array.from(room.consumers.values()).filter(c => c.producerId === producer.id);
 
     for (const consumer of consumers) {
         consumer.close();
         room.consumers.delete(consumer.id);
     }
-    producer.producer.close();
-    room.producers.delete(producer.producer.id);
+    producer.close();
+    room.producers.delete(producer.id);
+    peer.producers.delete(producer.id);
 
     socket.broadcast.to(peer.channelId).emit(CLOSE_PRODUCER, { producerId: payload.producerId });
 }
 
 function handleCloseConsumer({ peer, room }: HandlerContext, payload: CloseConsumer) {
-    console.log('closing consumer', payload.consumerId);
     const consumer = peer.consumers.get(payload.consumerId);
     if (!consumer?.closed) consumer?.close();
 
