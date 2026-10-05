@@ -39,7 +39,7 @@ const io: SfuServer = new Server(server, {
 const bootId = randomUUID();
 const sfuInstance: string = process.env.SFU_INSTANCE;
 
-const rooms = new Map<string, Room>();
+const rooms = new Map<string, Promise<Room>>();
 const peers = new Map<string, PeerData>();
 // userId → socket.id of that user's current peer on this SFU. One voice session per user: a new join replaces the old one.
 const socketByUser = new Map<string, string>();
@@ -175,10 +175,9 @@ io.on('connection', (socket) => {
         if (state !== 'joined' || !socket.connected) return undefined;
 
         const peer = peers.get(socket.id);
-        const room = peer && rooms.get(peer.channelId);
-        if (!peer || !room) return undefined;
+        if (!peer) return undefined;
 
-        return { socket, peer, room };
+        return { socket, peer, room: peer.room };
     };
 
     const onRequest = <S extends z.ZodType>(
@@ -258,6 +257,8 @@ io.on('connection', (socket) => {
             ack(await joinRoom(parsed.data) ?? null);
         } catch (error) {
             console.error(JOIN_ROOM, socket.id, error);
+            // Without this the socket would stay in 'joining', where every event (JOIN_ROOM included) is rejected.
+            socket.disconnect();
             ack(null);
         }
     }));
@@ -265,12 +266,11 @@ io.on('connection', (socket) => {
     const joinRoom = async (payload: JoinRoom) => {
         state = 'joining';
         const result = await handleJoinRoom(socket, socket.data.userId, socket.data.channelId, payload);
-        if (result === null) {
-            socket.disconnect();
-            throw new Error('Failed joining room');
-        }
+        // Disconnected while joining: leave the room here (the peer has no transports yet), so the queued disconnect
+        // cleanup finds no peer and publishes no peer_left for a join that never published peer_joined.
         if (socket.disconnected) {
-            peers.delete(socket.id);
+            const peer = peers.get(socket.id);
+            if (peer) removePeer(socket.id, peer);
             return;
         }
         state = 'joined';
@@ -306,47 +306,65 @@ io.on('connection', (socket) => {
     onSend(ACTIVE_SPEAKER_STATE, ActiveSpeakerStateSchema, handleUpdateActiveSpeakerState);
     onSend(CLOSE_PRODUCER, CloseProducerSchema, handleCloseProducer);
     onSend(CLOSE_CONSUMER, CloseConsumerSchema, handleCloseConsumer);
-    onSend(CLOSE_SFU_CLIENT, z.undefined(), ({ socket, peer }) => handleCloseClient(peer.channelId, socket, 'left'));
+    onSend(CLOSE_SFU_CLIENT, z.undefined(), ({ socket }) => handleCloseClient(socket, 'left'));
 
     socket.on('disconnect', (reason) => serialize(async () => {
         try {
-            await handleCloseClient(socket.data.channelId, socket, reason === 'client namespace disconnect' ? 'left' : 'dropped');
+            await handleCloseClient(socket, reason === 'client namespace disconnect' ? 'left' : 'dropped');
         } catch (error) {
             console.error('disconnect', socket.id, error);
         }
     }));
 });
 
+async function createRoom(): Promise<Room> {
+    const router = await worker.createRouter(ROUTER_CONFIG);
+    return { router, producers: new Map(), peers: new Map() };
+}
+
+// Not async on purpose: nothing here yields, so the promise is in the map before any other join can look.
+function getOrCreateRoom(channelId: string): Promise<Room> {
+    const existing = rooms.get(channelId);
+    if (existing) return existing;
+
+    const created = createRoom();          // starts creating; doesn't wait
+    rooms.set(channelId, created);         // reserve the channel immediately
+
+    // A failed creation must not stay cached, or every later join to this channel fails with the same error.
+    created.catch(() => {
+        if (rooms.get(channelId) === created) rooms.delete(channelId);
+    });
+
+    return created;
+}
+
 async function handleJoinRoom(socket: SfuSocket, userId: string, roomId: string, payload: JoinRoom) {
     socket.join(roomId);
 
-    if (!rooms.has(roomId)) {
-        try {
-            const router = await worker.createRouter(ROUTER_CONFIG);
-            rooms.set(roomId, {
-                router,
-                transports: new Map(),
-                consumers: new Map(),
-                producers: new Map(),
-            });
-        } catch (error) {
-            console.error(error)
-            return null;
-        }
-    }
+    // The last peer can leave and close the room while this join awaits it; removePeer drops the closed room from
+    // `rooms` first, so asking again yields a fresh one.
+    let room: Room;
+    do {
+        room = await getOrCreateRoom(roomId);
+    } while (room.router.closed);
 
-    peers.set(socket.id, {
+    // Added synchronously after the await, so the room can't be emptied and closed under this peer from here on.
+    const peerData: PeerData = {
         userId: userId,
         channelId: roomId,
         sessionId: socket.data.sessionId,
         consumers: new Map(),
         producers: new Map(),
         transports: new Map(),
+        room: room,
+        closed: false,
         isMuted: payload.isMuted,
         isDeafened: payload.isDeafened
-    });
+    };
 
-    const room = rooms.get(roomId)!;
+    room.peers.set(socket.id, peerData);
+    peers.set(socket.id, peerData);
+
     return { rtpCapabilities: room.router.rtpCapabilities };
 }
 
@@ -375,9 +393,18 @@ async function handleCreateTransport({ socket, peer, room }: HandlerContext) {
         ],
     });
 
+    // The peer can be closed while this awaited, e.g. replaced by a newer session from another socket's queue,
+    // which the per-socket queue can't order against. Its cleanup has already run, so nothing else would ever
+    // close this transport (or free its UDP port).
+    if (peer.closed) {
+        transport.close();
+        return null;
+    }
 
-    room.transports.set(transport.id, transport);
+    // Fires on every close path (explicit close, router closed), so maps are only ever cleaned here.
     peer.transports.set(transport.id, transport);
+    transport.observer.once('close', () => peer.transports.delete(transport.id));
+
     return ({
         id: transport.id,
         iceParameters: transport.iceParameters,
@@ -386,7 +413,7 @@ async function handleCreateTransport({ socket, peer, room }: HandlerContext) {
     });
 }
 
-async function handleConnectTransport({peer}: HandlerContext, payload: ConnectTransport) {
+async function handleConnectTransport({ peer }: HandlerContext, payload: ConnectTransport) {
     const transport = peer.transports.get(payload.transportId);
     if (!transport) return null;
 
@@ -394,7 +421,7 @@ async function handleConnectTransport({peer}: HandlerContext, payload: ConnectTr
     return true;
 }
 
-async function handleProduce({peer, room, socket}: HandlerContext, payload: CreateProducer) {
+async function handleProduce({ peer, room, socket }: HandlerContext, payload: CreateProducer) {
     const transport = peer.transports.get(payload.transportId);
     if (!transport) return null;
 
@@ -404,9 +431,24 @@ async function handleProduce({peer, room, socket}: HandlerContext, payload: Crea
     }
 
     const producer = await transport.produce({ kind: payload.kind, rtpParameters: payload.rtpParameters as RtpParameters, paused: payload.paused, appData: payload.appData });
-    console.log('producer appdata', producer.appData);
+    // Same as handleCreateTransport. mediasoup doesn't re-check after its own await either: a transport closed
+    // mid-request still returns a producer, which would otherwise never be closed or announced as gone.
+    if (peer.closed) {
+        producer.close();
+        return null;
+    }
+
     room.producers.set(producer.id, { producer: producer, userId: peer.userId });
     peer.producers.set(producer.id, producer);
+
+    // Fires on every close path: CLOSE_PRODUCER, the peer leaving or being replaced (its transport closes), and
+    // the router closing. mediasoup closes the producer's consumers itself, and their own listeners clean the
+    // consuming peers' maps. The broadcast lives here too so every path tells the room, not just some of them.
+    producer.observer.once('close', () => {
+        peer.producers.delete(producer.id);
+        room.producers.delete(producer.id);
+        socket.broadcast.to(peer.channelId).emit(CLOSE_PRODUCER, { producerId: producer.id });
+    });
 
     socket.broadcast.to(peer.channelId).emit(PRODUCER_JOINED, { producerId: producer.id, userId: peer.userId });
 
@@ -420,7 +462,7 @@ async function handleConsume({ socket, peer, room }: HandlerContext, payload: Cr
 
     // One live consumer per producer per peer: each consumer is another forwarded copy of the stream, so
     // duplicates would let one client multiply the SFU's outgoing bandwidth.
-    if (Array.from(peer.consumers.values()).some(c => c.producerId === payload.producerId && !c.closed)) {
+    if (Array.from(peer.consumers.values()).some(c => c.producerId === payload.producerId)) {
         console.warn('consumer cap reached', socket.id, payload.producerId);
         return null;
     }
@@ -428,9 +470,16 @@ async function handleConsume({ socket, peer, room }: HandlerContext, payload: Cr
     if (!room.router.canConsume({ producerId: payload.producerId, rtpCapabilities: payload.rtpCapabilities })) return null;
 
     const consumer = await transport.consume({ producerId: payload.producerId, rtpCapabilities: payload.rtpCapabilities, paused: false, appData: producer.producer.appData });
+    // Same as handleCreateTransport and handleProduce.
+    if (peer.closed) {
+        consumer.close();
+        return null;
+    }
 
-    room.consumers.set(consumer.id, consumer);
+    // Fires on every close path, including the producer or this peer's transport closing.
     peer.consumers.set(consumer.id, consumer);
+    consumer.observer.once('close', () => peer.consumers.delete(consumer.id));
+
     return { id: consumer.id, producerId: payload.producerId, kind: consumer.kind, rtpParameters: consumer.rtpParameters, appData: consumer.appData };
 }
 
@@ -497,33 +546,45 @@ async function replacePreviousSession(userId: string, socket: SfuSocket) {
 
     // Delivered before the disconnect that handleCloseClient sends: a socket's packets arrive in order.
     previousSocket.emit(SESSION_REPLACED);
-    await handleCloseClient(previousPeer.channelId, previousSocket, 'left');
+    await handleCloseClient(previousSocket, 'left');
 }
 
-async function handleCloseClient(roomId: string, socket: SfuSocket, reason: 'left' | 'dropped') {
-    const room = rooms.get(roomId)!;
+/**
+ * Removes the peer from both indexes and closes its room if it was the last one in it. The only place either index
+ * loses a peer, so they can't drift apart.
+ */
+function removePeer(socketId: string, peer: PeerData) {
+    peers.delete(socketId);
+    peer.room.peers.delete(socketId);
+
+    if (peer.room.peers.size === 0) {
+        // Deleting by channelId can't hit a newer room for the same channel: a room reaches zero peers only once,
+        // because the join loop in handleJoinRoom never adds a peer to a closed room. Removed from the map before
+        // closing, so a join retrying in that loop gets a fresh room.
+        rooms.delete(peer.channelId);
+        peer.room.router.close();
+    }
+}
+
+async function handleCloseClient(socket: SfuSocket, reason: 'left' | 'dropped') {
     const socketId = socket.id;
 
     const peer = peers.get(socketId);
     if (!peer) return;
+    peer.closed = true;
 
-    for (const producer of Array.from(peer.producers.values())) {
-        console.log(room.producers.delete(producer.id));
-        producer.close();
-        socket.broadcast.to(roomId).emit(CLOSE_PRODUCER, { producerId: producer.id });
-    }
-
-    for (const consumer of Array.from(peer.consumers.values())) {
-        room.consumers.delete(consumer.id);
-        consumer.close();
-    }
-
+    // Every producer and consumer lives on one of the peer's transports, so closing those closes everything; the
+    // observer 'close' listeners clean the maps and tell the room about each closed producer. A failing close is
+    // logged rather than thrown, so it can't skip the other transports or the steps below.
     for (const transport of Array.from(peer.transports.values())) {
-        transport.close();
-        room.transports.delete(transport.id);
+        try {
+            transport.close();
+        } catch (error) {
+            console.error('closing transport', socketId, transport.id, error);
+        }
     }
 
-    peers.delete(socketId);
+    removePeer(socketId, peer);
     // Only if it still points here: when a replaced session is closed, the index already points to the new one.
     if (socketByUser.get(peer.userId) === socketId) socketByUser.delete(peer.userId);
     socket.disconnect();
@@ -543,29 +604,15 @@ function getProducers({ room }: HandlerContext) {
     return { producers: Array.from(room.producers.values()).map(p => ({ userId: p.userId, producerId: p.producer.id })) };
 }
 
-function handleCloseProducer({ socket, peer, room }: HandlerContext, payload: CloseProducer) {
-    const producer = peer.producers.get(payload.producerId);
-    if (!producer) return;
-
-    const consumers = Array.from(room.consumers.values()).filter(c => c.producerId === producer.id);
-
-    for (const consumer of consumers) {
-        consumer.close();
-        room.consumers.delete(consumer.id);
-    }
-    producer.close();
-    room.producers.delete(producer.id);
-    peer.producers.delete(producer.id);
-
-    socket.broadcast.to(peer.channelId).emit(CLOSE_PRODUCER, { producerId: payload.producerId });
+// mediasoup closes the producer's consumers; the observer 'close' listeners registered in handleProduce and
+// handleConsume clean the maps and broadcast CLOSE_PRODUCER.
+function handleCloseProducer({ peer }: HandlerContext, payload: CloseProducer) {
+    peer.producers.get(payload.producerId)?.close();
 }
 
-function handleCloseConsumer({ peer, room }: HandlerContext, payload: CloseConsumer) {
-    const consumer = peer.consumers.get(payload.consumerId);
-    if (!consumer?.closed) consumer?.close();
-
-    peer.consumers.delete(payload.consumerId);
-    room.consumers.delete(payload.consumerId);
+// The consumer's observer 'close' listener (handleConsume) removes it from peer.consumers.
+function handleCloseConsumer({ peer }: HandlerContext, payload: CloseConsumer) {
+    peer.consumers.get(payload.consumerId)?.close();
 }
 
 process.on('unhandledRejection', (reason) => {
@@ -576,14 +623,7 @@ process.on('unhandledRejection', (reason) => {
 process.on("SIGTERM", () => {
     console.log("Shutting down SFU service...");
 
-    for (const room of Array.from(rooms.values())) {
-        for (const transport of Array.from(room.transports.values())) transport.close();
-        for (const producer of Array.from(room.producers.values())) producer.producer.close();
-        for (const consumer of Array.from(room.consumers.values())) consumer.close();
-
-        room.router.close();
-    }
-
+    // Closing the worker closes every router, and with them every transport, producer and consumer.
     worker.close();
     process.exit(0);
 });
