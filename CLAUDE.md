@@ -81,15 +81,29 @@ All runtime logic is in `src/index.ts`. Supporting files:
 
 ### State
 - One mediasoup `Worker`, created in `main()` before the server starts listening.
-- `rooms: Map<channelId, Room>` — one `Router` per voice channel, created lazily on the first `JOIN_ROOM`,
-  plus room-wide maps of transports/producers/consumers (`src/interface/room.ts`).
+- `rooms: Map<channelId, Promise<Room>>` — one `Router` per voice channel. `getOrCreateRoom` stores the
+  creation promise before anything awaits, so concurrent first joiners share one router; a failed creation
+  removes its entry. A `Room` (`src/interface/room.ts`) holds the router, its `peers`, and a `producers`
+  lookup index (for consuming and `GET_PRODUCERS`).
 - `peers: Map<socket.id, PeerData>` — the peer's user/channel/session, its own transports/producers/consumers,
-  and the mute/deafen state it joined with.
+  a direct `room` reference, a `closed` flag, and the mute/deafen state it joined with.
 - `socketByUser: Map<userId, socket.id>` — one voice session per user per SFU (see below).
 - `jtiMap` — seen ticket `jti`s until expiry, for replay protection.
 
-Objects are tracked in **both** `room.*` and `peer.*` maps by hand, which is the root cause of the remaining
-bookkeeping bugs listed below.
+**Cleanup is event-driven.** Each transport/producer/consumer is removed from its maps only by its own
+`observer` `'close'` listener (registered where it's created), which mediasoup emits on every close path —
+explicit close, its transport closing, its producer closing, the router closing. Handlers only *close* things;
+closing a peer's transports cascades to its producers and consumers. The producer's listener also broadcasts
+`CLOSE_PRODUCER`.
+
+**Room lifecycle.** `removePeer` is the only place a peer leaves `peers` or `room.peers`; when the room
+empties it is removed from `rooms` and its router closed. Joins loop on `getOrCreateRoom` until the router
+is open and add the peer synchronously after the await, so a room is never joined after it closed — which is
+also why deleting by `channelId` can't hit a newer room.
+
+**Liveness after `await`.** A peer can be closed from another socket's queue (session replacement) while one
+of its requests awaits mediasoup. `handleCreateTransport`/`handleProduce`/`handleConsume` check `peer.closed`
+after the await and close what they just created; mediasoup itself doesn't re-check after its own awaits.
 
 ### Connection lifecycle
 1. **Ticket auth (`io.use` middleware).** Verifies `handshake.auth.ticket`: ES256 only, `iss: guild-service`,
@@ -149,18 +163,6 @@ for this `sfuInstance` against the snapshot, which repairs events dropped while 
 
 ## Known rough edges (good learning targets — flag these when relevant)
 
-- **Bookkeeping drift between `room.*` and `peer.*`.** `handleCloseProducer` doesn't remove the closed
-  consumers from the consuming peers' `peer.consumers`; when a peer leaves, mediasoup closes other peers'
-  consumers of its producers but the maps keep them (the consumer cap ignores `closed` ones for this reason).
-  The idiomatic fix is to drive cleanup from mediasoup events (`producerclose`, `transportclose`, `observer`
-  `close`) with one source of truth.
-- **Rooms/routers are never removed** when the last peer leaves.
-- **Router creation race:** two first joins to the same channel can both create a router; one leaks. Store
-  the creation promise in the map instead.
-- **Replaced sessions bypass the queue:** `replacePreviousSession` closes the *old* socket from the *new*
-  socket's queue, so a request in flight on the old socket can still create a transport after cleanup.
-  Event-driven cleanup would cover it.
-- `handleJoinRoom` and `handleCloseClient` still use `rooms.get(…)!` (they run outside `HandlerContext`).
 - Transport direction isn't checked: a peer can produce on its own recv transport or consume on its send
   transport. Low severity — only its own transports.
 - `ClientToServerEvents` is still `DefaultEventsMap`: the compiler doesn't tie event name ↔ schema ↔ ack
