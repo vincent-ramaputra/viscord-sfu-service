@@ -4,7 +4,7 @@ import * as mediasoup from "mediasoup";
 import { Room } from "./interface/room";
 import { DtlsParameters, RtpParameters, Worker } from "mediasoup/types";
 import { CONNECT_TRANSPORT, CREATE_CONSUMER, CREATE_TRANSPORT, CLOSE_SFU_CLIENT, JOIN_ROOM, CREATE_PRODUCER, RESUME_CONSUMER, PAUSE_CONSUMER, GET_PRODUCERS, PRODUCER_JOINED, ACTIVE_SPEAKER_STATE, RESUME_PRODUCER, PAUSE_PRODUCER, CLOSE_PRODUCER, CLOSE_CONSUMER, SESSION_REPLACED } from "./const/events";
-import { CLOCK_TOLERANCE_S, ROUTER_CONFIG } from "./const/configs";
+import { CLOCK_TOLERANCE_S, MAX_TRANSPORTS_PER_PEER, ROUTER_CONFIG } from "./const/configs";
 import { PeerData } from "./interface/peer-data";
 import { createServer } from "http";
 import { errors, importSPKI, jwtVerify } from 'jose';
@@ -159,11 +159,20 @@ io.use(async (socket, next) => {
 
 io.on('connection', (socket) => {
     let state: 'none' | 'joining' | 'joined' = 'none';
+    let queue: Promise<unknown> = Promise.resolve();
 
-    // Undefined before JOIN_ROOM has finished, and again once the peer is closed (left, dropped, or replaced by a
-    // newer session of the same user), so events in either window are rejected instead of reaching a handler.
+    // Every event from this socket (disconnect included) runs one at a time, so a handler's check, await, then write
+    // can't interleave with another event from the same peer: the per-peer caps rely on this, and cleanup waits for
+    // an in-flight request instead of missing what it creates. fn must not reject (each one catches its own errors);
+    // a task that never settles would stall this socket's events, cleanup included.
+    const serialize = (fn: () => Promise<unknown>) => (queue = queue.then(fn, fn));
+
+    // Undefined before JOIN_ROOM has finished, and again once the socket disconnected or the peer is closed (left,
+    // dropped, or replaced by a newer session of the same user), so events in either window are rejected instead of
+    // reaching a handler. The disconnect check also lets cleanup run right after an in-flight event, not after
+    // everything queued behind it.
     const resolveContext = (): HandlerContext | undefined => {
-        if (state !== 'joined') return undefined;
+        if (state !== 'joined' || !socket.connected) return undefined;
 
         const peer = peers.get(socket.id);
         const room = peer && rooms.get(peer.channelId);
@@ -177,7 +186,7 @@ io.on('connection', (socket) => {
         schema: S,
         handler: (ctx: HandlerContext, payload: z.output<S>) => unknown
     ) => {
-        socket.on(event, async (...args: unknown[]) => {
+        socket.on(event, (...args: unknown[]) => serialize(async () => {
             const ack = args.at(-1);
             if (typeof ack !== 'function') return;
 
@@ -201,7 +210,7 @@ io.on('connection', (socket) => {
                 console.error(event, socket.id, error);
                 ack(null);
             }
-        });
+        }));
     }
 
     const onSend = <S extends z.ZodType>(
@@ -209,7 +218,7 @@ io.on('connection', (socket) => {
         schema: S,
         handler: (ctx: HandlerContext, payload: z.output<S>) => unknown
     ) => {
-        socket.on(event, async (...args: unknown[]) => {
+        socket.on(event, (...args: unknown[]) => serialize(async () => {
             const ctx = resolveContext();
             if (!ctx) return;
 
@@ -225,11 +234,11 @@ io.on('connection', (socket) => {
             } catch (error) {
                 console.error(event, socket.id, error);
             }
-        });
+        }));
     }
 
     // JOIN_ROOM creates the peer, so it can't go through onRequest, which needs one. Same ack/validation contract.
-    socket.on(JOIN_ROOM, async (...args: unknown[]) => {
+    socket.on(JOIN_ROOM, (...args: unknown[]) => serialize(async () => {
         const ack = args.at(-1);
         if (typeof ack !== 'function') return;
         if (state !== 'none') {
@@ -251,7 +260,7 @@ io.on('connection', (socket) => {
             console.error(JOIN_ROOM, socket.id, error);
             ack(null);
         }
-    });
+    }));
 
     const joinRoom = async (payload: JoinRoom) => {
         state = 'joining';
@@ -299,7 +308,13 @@ io.on('connection', (socket) => {
     onSend(CLOSE_CONSUMER, CloseConsumerSchema, handleCloseConsumer);
     onSend(CLOSE_SFU_CLIENT, z.undefined(), ({ socket, peer }) => handleCloseClient(peer.channelId, socket, 'left'));
 
-    socket.on('disconnect', async (reason) => await handleCloseClient(socket.data.channelId, socket, reason === 'client namespace disconnect' ? 'left' : 'dropped'));
+    socket.on('disconnect', (reason) => serialize(async () => {
+        try {
+            await handleCloseClient(socket.data.channelId, socket, reason === 'client namespace disconnect' ? 'left' : 'dropped');
+        } catch (error) {
+            console.error('disconnect', socket.id, error);
+        }
+    }));
 });
 
 async function handleJoinRoom(socket: SfuSocket, userId: string, roomId: string, payload: JoinRoom) {
@@ -339,7 +354,13 @@ function handleUpdateActiveSpeakerState({ socket, peer }: HandlerContext, payloa
     socket.broadcast.to(peer.channelId).emit(ACTIVE_SPEAKER_STATE, { ...payload, userId: peer.userId });
 }
 
-async function handleCreateTransport({ peer, room }: HandlerContext) {
+async function handleCreateTransport({ socket, peer, room }: HandlerContext) {
+    // Checked before createWebRtcTransport: each transport reserves a UDP port from the shared RTC port range.
+    if (peer.transports.size >= MAX_TRANSPORTS_PER_PEER) {
+        console.warn('transport cap reached', socket.id);
+        return null;
+    }
+
     const transport = await room.router.createWebRtcTransport({
         enableUdp: true,
         enableTcp: true,
@@ -377,6 +398,11 @@ async function handleProduce({peer, room, socket}: HandlerContext, payload: Crea
     const transport = peer.transports.get(payload.transportId);
     if (!transport) return null;
 
+    if (Array.from(peer.producers.values()).some(p => p.appData.mediaTag === payload.appData.mediaTag)) {
+        console.warn('producer cap reached', socket.id, payload.appData.mediaTag);
+        return null;
+    }
+
     const producer = await transport.produce({ kind: payload.kind, rtpParameters: payload.rtpParameters as RtpParameters, paused: payload.paused, appData: payload.appData });
     console.log('producer appdata', producer.appData);
     room.producers.set(producer.id, { producer: producer, userId: peer.userId });
@@ -387,10 +413,17 @@ async function handleProduce({peer, room, socket}: HandlerContext, payload: Crea
     return { id: producer.id };
 }
 
-async function handleConsume({ peer, room }: HandlerContext, payload: CreateConsumer) {
+async function handleConsume({ socket, peer, room }: HandlerContext, payload: CreateConsumer) {
     const transport = peer.transports.get(payload.transportId);
     const producer = room.producers.get(payload.producerId);
     if (!transport || !producer) return null;
+
+    // One live consumer per producer per peer: each consumer is another forwarded copy of the stream, so
+    // duplicates would let one client multiply the SFU's outgoing bandwidth.
+    if (Array.from(peer.consumers.values()).some(c => c.producerId === payload.producerId && !c.closed)) {
+        console.warn('consumer cap reached', socket.id, payload.producerId);
+        return null;
+    }
 
     if (!room.router.canConsume({ producerId: payload.producerId, rtpCapabilities: payload.rtpCapabilities })) return null;
 

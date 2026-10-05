@@ -1,4 +1,5 @@
 import { Consumer, Producer, Transport } from "mediasoup/types";
+import { ProducerAppData } from "../schemas/create-producer.schema";
 
 export interface PeerData {
     userId: string;
@@ -6,7 +7,7 @@ export interface PeerData {
     sessionId: string;
     transports: Map<string, Transport>;
     consumers: Map<string, Consumer>;
-    producers: Map<string, Producer>;
+    producers: Map<string, Producer<ProducerAppData>>;
     isMuted: boolean;
     isDeafened: boolean;
 }

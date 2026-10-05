@@ -12,3 +12,4 @@ export const CreateProducerSchema = z.object({
     { error: 'mediaTag does not match producer kind' });
 
 export type CreateProducer = z.infer<typeof CreateProducerSchema>;
+export type ProducerAppData = CreateProducer['appData'];
