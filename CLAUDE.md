@@ -88,7 +88,7 @@ All runtime logic is in `src/index.ts`. Supporting files:
 - `socketByUser: Map<userId, socket.id>` — one voice session per user per SFU (see below).
 - `jtiMap` — seen ticket `jti`s until expiry, for replay protection.
 
-Objects are tracked in **both** `room.*` and `peer.*` maps by hand, which is the root cause of several
+Objects are tracked in **both** `room.*` and `peer.*` maps by hand, which is the root cause of the remaining
 bookkeeping bugs listed below.
 
 ### Connection lifecycle
@@ -97,16 +97,31 @@ bookkeeping bugs listed below.
    Sets `socket.data = { userId: sub, channelId, sessionId: jti }`. The channel always comes from the ticket,
    never from a client payload.
 2. **Per-socket state machine** in the `connection` closure: `'none' → 'joining' → 'joined'`.
-3. **`onRequest` / `onSend` wrappers** register every client event. They check the ack is a function
-   (requests only), guard on `state === 'joined'` (JOIN_ROOM opts out with `{ requireJoin: false }`),
-   `safeParse` the payload, and run the handler in try/catch. Requests always ack exactly once: the result,
-   or `null` on any failure — the client's `sfu-client.ts` turns `null` into an error. Handlers get only the
-   validated payload; the arrow function at the registration site passes `socket`/`socket.data` in.
-4. **Schema conventions:** mediasoup params (`dtlsParameters`, `rtpParameters`, `rtpCapabilities`) are checked
+3. **Per-socket event queue (`serialize`).** Every event from a socket, `disconnect` included, runs one at a
+   time on a promise chain. A handler's check → `await` → write can't interleave with another event from the
+   same peer; the per-peer caps depend on this, and cleanup waits for an in-flight request instead of
+   missing what it creates. Queued tasks must never reject (each catches its own errors), and one that never
+   settles stalls that socket's events, cleanup included.
+4. **`onRequest` / `onSend` wrappers** register every post-join event. Inside the queue they check the ack is
+   a function (requests only), resolve a **`HandlerContext` `{ socket, peer, room }`**
+   (`src/interface/handler-context.ts`) — rejected unless the socket is joined, still connected, and its peer
+   and room exist — then `safeParse` the payload and run `handler(ctx, payload)` in try/catch. Requests always
+   ack exactly once: the result, or `null` on any failure — the client's `sfu-client.ts` turns `null` into an
+   error. Handlers are registered directly (`onSend(PAUSE_PRODUCER, PauseProducerSchema, handlePauseProducer)`)
+   and never look up or assert the peer/room themselves. JOIN_ROOM, which creates the peer, has its own
+   registration with the same contract.
+5. **Ownership rule:** anything a handler *acts on* is looked up in `ctx.peer.*` (transports, producers,
+   consumers); only reads go through `ctx.room.*` — notably the producer in `CREATE_CONSUMER`, since consuming
+   other peers' media is the point.
+6. **Per-peer caps:** `MAX_TRANSPORTS_PER_PEER` (2, `src/const/configs.ts`) checked before
+   `createWebRtcTransport` (each reserves a UDP port); one producer per `appData.mediaTag`; one live consumer
+   per producer (otherwise one client could multiply outgoing bandwidth). Cap hits are logged at warn.
+7. **Schema conventions:** mediasoup params (`dtlsParameters`, `rtpParameters`, `rtpCapabilities`) are checked
    shallowly with `z.looseObject({})` and cast at the call site — mediasoup validates them in depth and its
    errors become `ack(null)`. Anything relayed to other clients (`appData.mediaTag`, `{ speaking }`) is
-   validated strictly. Fields the server doesn't use are left out so zod strips them.
-5. `process.on('unhandledRejection')` only logs — a safety net, not error handling.
+   validated strictly. Fields the server doesn't use are left out so zod strips them. Producer `appData` is
+   typed as `ProducerAppData` (derived from `CreateProducerSchema`) in `PeerData` and `Room`.
+8. `process.on('unhandledRejection')` only logs — a safety net, not error handling.
 
 ### Signaling flow
 1. `JOIN_ROOM {isMuted, isDeafened}` → creates the router if needed and the peer, publishes `peer_joined`,
@@ -134,22 +149,20 @@ for this `sfuInstance` against the snapshot, which repairs events dropped while 
 
 ## Known rough edges (good learning targets — flag these when relevant)
 
-- **No ownership checks.** Transports and producers are looked up in `room.*`, not the caller's `peer.*`, and
-  producer IDs are broadcast to the room. Any participant can pause/close someone else's producer, or
-  connect/produce/consume on someone else's transport.
-- **No per-peer caps.** Each `CREATE_TRANSPORT` reserves a UDP port; a loop exhausts `RTC_MIN_PORT..MAX` for
-  the whole instance. Producers per peer are unbounded too.
-- **Bookkeeping drift between `room.*` and `peer.*`.** `handleCloseProducer` doesn't remove from
-  `peer.producers` or from consuming peers' `peer.consumers`; when a peer leaves, mediasoup closes other peers'
-  consumers of its producers but the maps keep them. The idiomatic fix is to drive cleanup from mediasoup
-  events (`producerclose`, `transportclose`, `observer` `close`) with one source of truth.
+- **Bookkeeping drift between `room.*` and `peer.*`.** `handleCloseProducer` doesn't remove the closed
+  consumers from the consuming peers' `peer.consumers`; when a peer leaves, mediasoup closes other peers'
+  consumers of its producers but the maps keep them (the consumer cap ignores `closed` ones for this reason).
+  The idiomatic fix is to drive cleanup from mediasoup events (`producerclose`, `transportclose`, `observer`
+  `close`) with one source of truth.
 - **Rooms/routers are never removed** when the last peer leaves.
 - **Router creation race:** two first joins to the same channel can both create a router; one leaks. Store
   the creation promise in the map instead.
-- `rooms.get(…)!` / `peers.get(…)!` remain in handlers. The join-state guard makes them safe today; a
-  per-request context resolved once in the wrapper would make it a guarantee.
-- The `disconnect` handler is a raw `socket.on` outside the wrappers; a throw in `handleCloseClient` goes to
-  the unhandled-rejection log and cleanup stops halfway.
+- **Replaced sessions bypass the queue:** `replacePreviousSession` closes the *old* socket from the *new*
+  socket's queue, so a request in flight on the old socket can still create a transport after cleanup.
+  Event-driven cleanup would cover it.
+- `handleJoinRoom` and `handleCloseClient` still use `rooms.get(…)!` (they run outside `HandlerContext`).
+- Transport direction isn't checked: a peer can produce on its own recv transport or consume on its send
+  transport. Low severity — only its own transports.
 - `ClientToServerEvents` is still `DefaultEventsMap`: the compiler doesn't tie event name ↔ schema ↔ ack
   type, so a handler returning the wrong shape (or nothing) isn't caught.
 - **No `worker.on('died')`**: if the worker dies, the process stays up and every call fails. One worker also
